@@ -2,17 +2,18 @@ import fetch from 'node-fetch';
 
 export default async function handler(req, res) {
   try {
-    const TRENDS_TOKEN = process.env.TRENDS_API_TOKEN;
-    const SHOPIFY_STORE = process.env.SHOPIFY_STORE_URL;
-    const SHOPIFY_TOKEN = process.env.SHOPIFY_ADMIN_TOKEN;
+const TRENDS_TOKEN = process.env.TRENDS_API_TOKEN;
+const SHOPIFY_STORE = process.env.SHOPIFY_STORE_URL;
+const SHOPIFY_TOKEN = process.env.SHOPIFY_ADMIN_TOKEN;
 
     // 1. Ambil data dari trends.nz
-    const trendsRes = await fetch('https://nz.api.trends.nz/api/v1/products.json', {
-      headers: {
-        'Authorization': `Bearer ${TRENDS_TOKEN}`,
-        'Accept': 'application/json'
-      }
-    });
+const trendsRes = await fetch('https://au.api.trends.nz/api/v1/products', {
+  headers: {
+    // Baris 12: Masukkan nilai variabel langsung tanpa tanda kutip
+    'Authorization': TRENDS_TOKEN,
+    'Accept': 'application/json'
+  }
+});
 
     if (!trendsRes.ok) {
       throw new Error(`Trends API Error: ${trendsRes.statusText}`);

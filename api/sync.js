@@ -2,33 +2,40 @@ import fetch from 'node-fetch';
 
 export default async function handler(req, res) {
   try {
-const TRENDS_TOKEN = process.env.TRENDS_API_TOKEN;
-const SHOPIFY_STORE = process.env.SHOPIFY_STORE_URL;
-const SHOPIFY_TOKEN = process.env.SHOPIFY_ADMIN_TOKEN;
+    const TRENDS_TOKEN = process.env.TRENDS_API_TOKEN;
+    const SHOPIFY_STORE = process.env.SHOPIFY_STORE_URL;
+    const SHOPIFY_TOKEN = process.env.SHOPIFY_ADMIN_TOKEN;
 
-    // 1. Ambil data dari trends.nz
-const trendsRes = await fetch('https://au.api.trends.nz/api/v1/products', {
-  headers: {
-    // Baris 12: Masukkan nilai variabel langsung tanpa tanda kutip
-    'Authorization': TRENDS_TOKEN,
-    'Accept': 'application/json'
-  }
-});
+    // 1. Ambil data dari Trends NZ (Gunakan URL tanpa ekstensi .json)
+    const trendsRes = await fetch('https://au.api.trends.nz/api/v1/products', {
+      headers: {
+        'Authorization': TRENDS_TOKEN,
+        'Accept': 'application/json'
+      }
+    });
 
+    // Cek jika respon Trends bukan 200 OK
     if (!trendsRes.ok) {
-      throw new Error(`Trends API Error: ${trendsRes.statusText}`);
+      const errorText = await trendsRes.text();
+      return res.status(trendsRes.status).json({
+        success: false,
+        source: 'Trends NZ API Error',
+        status: trendsRes.status,
+        details: errorText.substring(0, 300)
+      });
     }
 
     const trendsData = await trendsRes.json();
     let updatedCount = 0;
 
-    // 2. Loop & update harga ke Shopify jika SKU cocok
-    // Catatan: Sesuaikan field 'products' & 'price' dengan struktur JSON aktual dari trends.nz
-    if (trendsData && trendsData.products) {
-      for (const item of trendsData.products) {
+    // 2. Loop & update harga ke Shopify jika data produk ada
+    if (trendsData && (trendsData.products || Array.isArray(trendsData))) {
+      const productList = trendsData.products || trendsData;
+
+      for (const item of productList) {
         if (!item.sku || !item.price) continue;
 
-        // Cari Variant ID di Shopify via REST API berdasarkan SKU
+        // Cari Variant ID di Shopify via REST API
         const shopifySearch = await fetch(`https://${SHOPIFY_STORE}/admin/api/2026-01/variants.json?sku=${item.sku}`, {
           headers: {
             'X-Shopify-Access-Token': SHOPIFY_TOKEN,
@@ -36,12 +43,13 @@ const trendsRes = await fetch('https://au.api.trends.nz/api/v1/products', {
           }
         });
 
-        const searchData = await shopifySearch.json();
+        if (!shopifySearch.ok) continue;
 
-        if (searchData.variants && searchData.variants.length > 0) {
-          const variantId = searchData.variants[0].id;
+        const shopifyData = await shopifySearch.json();
+        if (shopifyData.variants && shopifyData.variants.length > 0) {
+          const variantId = shopifyData.variants[0].id;
 
-          // Update harga varian tersebut
+          // Update harga variant di Shopify
           await fetch(`https://${SHOPIFY_STORE}/admin/api/2026-01/variants/${variantId}.json`, {
             method: 'PUT',
             headers: {
@@ -63,10 +71,13 @@ const trendsRes = await fetch('https://au.api.trends.nz/api/v1/products', {
 
     return res.status(200).json({
       success: true,
-      message: `Sync berhasil. Total ${updatedCount} harga produk diperbarui.`
+      message: `Berhasil sinkronisasi ${updatedCount} produk.`
     });
 
   } catch (error) {
-    return res.status(500).json({ success: false, error: error.message });
+    return res.status(500).json({
+      success: false,
+      error: error.message
+    });
   }
 }

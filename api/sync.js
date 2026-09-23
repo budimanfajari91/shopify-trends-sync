@@ -7,7 +7,7 @@ export default async function handler(req, res) {
     const SHOPIFY_TOKEN = process.env.SHOPIFY_ADMIN_TOKEN;
 
     // 1. Ambil data dari Trends NZ (Gunakan URL tanpa ekstensi .json)
-    const trendsRes = await fetch('https://au.api.trends.nz/api/v1/products', {
+    const trendsRes = await fetch('https://au.api.trends.nz/api/v1/products.json', {
       headers: {
         'Authorization': TRENDS_TOKEN,
         'Accept': 'application/json'

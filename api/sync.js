@@ -3,7 +3,6 @@ import fetch from 'node-fetch';
 export default async function handler(req, res) {
   try {
     const TRENDS_TOKEN = process.env.TRENDS_API_TOKEN;
-    // Membersihkan URL toko jika user tidak sengaja memasukkan https://
     let SHOPIFY_STORE = (process.env.SHOPIFY_STORE_URL || '').replace(/^https?:\/\//, '').replace(/\/$/, '');
     const SHOPIFY_TOKEN = process.env.SHOPIFY_ADMIN_TOKEN;
 
@@ -11,7 +10,6 @@ export default async function handler(req, res) {
       ? TRENDS_TOKEN 
       : `Bearer ${TRENDS_TOKEN}`;
 
-    // 1. Ambil data dari Trends NZ
     const trendsRes = await fetch('https://au.api.trends.nz/api/v1/products.json', {
       headers: {
         'Authorization': authHeader,
@@ -28,28 +26,33 @@ export default async function handler(req, res) {
       ? trendsData 
       : (trendsData.products || trendsData.data || []);
 
-    let updatedCount = 0;
-    let skippedCount = 0;
+    let trulyUpdatedList = [];
+    let unchangedCount = 0;
+    let notFoundCount = 0;
 
-    // 2. Loop produk dari Trends NZ
+    // Koefisien Markup: 1 + 0.645 = 1.645 (Markup 64.5%)
+    const MARKUP_MULTIPLIER = 1.645;
+
     for (const item of productList) {
-      // Trends menggunakan field 'code' untuk SKU
       const sku = item.code || item.sku;
       
-      // Ambil harga kuantitas pertama dari array 'pricing.prices'
-      let price = null;
+      let basePrice = null;
+
+      // 1. Ambil harga dari kuantitas terkecil (tier pertama pada array prices)
       if (item.pricing && Array.isArray(item.pricing.prices) && item.pricing.prices.length > 0) {
-        price = item.pricing.prices[0].price; // Mengambil harga tier pertama (misal: 0.22)
+        // prices[0] selalu menyimpan kuantitas paling sedikit (MoQ terendah)
+        basePrice = item.pricing.prices[0].price;
       } else if (typeof item.price === 'number' || typeof item.price === 'string') {
-        price = item.price;
+        basePrice = item.price;
       }
 
-      if (!sku || price === null || price === undefined) {
-        skippedCount++;
-        continue;
-      }
+      if (!sku || basePrice === null || basePrice === undefined) continue;
 
-      // Cari SKU di Shopify via GraphQL Admin API
+      // 2. Hitung harga baru dengan Markup 64.5%
+      const calculatedPrice = parseFloat(basePrice) * MARKUP_MULTIPLIER;
+      const newPriceStr = calculatedPrice.toFixed(2); // Format 2 desimal standar Shopify
+
+      // 3. Cari SKU di Shopify via GraphQL
       const graphqlQuery = {
         query: `
           query {
@@ -58,6 +61,7 @@ export default async function handler(req, res) {
                 node {
                   id
                   price
+                  sku
                 }
               }
             }
@@ -82,10 +86,10 @@ export default async function handler(req, res) {
       if (variants.length > 0) {
         const variantNode = variants[0].node;
         const variantId = variantNode.id;
-        const newPriceStr = price.toString();
+        const currentShopifyPrice = parseFloat(variantNode.price).toFixed(2);
 
-        // Update jika harga di Shopify berbeda dengan harga Trends NZ
-        if (variantNode.price !== newPriceStr) {
+        // Hanya update jika harga Shopify saat ini berbeda dengan harga bertingkat baru
+        if (currentShopifyPrice !== newPriceStr) {
           const updateMutation = {
             query: `
               mutation productVariantUpdate($input: ProductVariantInput!) {
@@ -105,7 +109,7 @@ export default async function handler(req, res) {
             }
           };
 
-          await fetch(`https://${SHOPIFY_STORE}/admin/api/2026-01/graphql.json`, {
+          const updateRes = await fetch(`https://${SHOPIFY_STORE}/admin/api/2026-01/graphql.json`, {
             method: 'POST',
             headers: {
               'X-Shopify-Access-Token': SHOPIFY_TOKEN,
@@ -114,15 +118,28 @@ export default async function handler(req, res) {
             body: JSON.stringify(updateMutation)
           });
 
-          updatedCount++;
+          if (updateRes.ok) {
+            trulyUpdatedList.push({
+              sku: sku,
+              harga_modal_trends: basePrice,
+              harga_shopify_lama: currentShopifyPrice,
+              harga_shopify_baru_with_markup: newPriceStr
+            });
+          }
+        } else {
+          unchangedCount++;
         }
+      } else {
+        notFoundCount++;
       }
     }
 
     return res.status(200).json({
       success: true,
-      message: `Proses Selesai. Berhasil memperbarui ${updatedCount} produk.`,
-      skipped: skippedCount
+      total_produk_diubah: trulyUpdatedList.length,
+      produk_harga_sudah_sesuai: unchangedCount,
+      sku_tidak_ditemukan: notFoundCount,
+      detail_update: trulyUpdatedList
     });
 
   } catch (error) {

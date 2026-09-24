@@ -6,15 +6,19 @@ export default async function handler(req, res) {
     const SHOPIFY_STORE = process.env.SHOPIFY_STORE_URL;
     const SHOPIFY_TOKEN = process.env.SHOPIFY_ADMIN_TOKEN;
 
-    // 1. Ambil data dari Trends NZ (Gunakan URL tanpa ekstensi .json)
+    // Masukkan prefiks Bearer secara otomatis jika belum ada
+    const authHeader = TRENDS_TOKEN?.startsWith('Bearer') 
+      ? TRENDS_TOKEN 
+      : `Bearer ${TRENDS_TOKEN}`;
+
+    // 1. Ambil data dari Trends NZ
     const trendsRes = await fetch('https://au.api.trends.nz/api/v1/products.json', {
       headers: {
-        'Authorization': TRENDS_TOKEN,
+        'Authorization': authHeader,
         'Accept': 'application/json'
       }
     });
 
-    // Cek jika respon Trends bukan 200 OK
     if (!trendsRes.ok) {
       const errorText = await trendsRes.text();
       return res.status(trendsRes.status).json({
@@ -28,40 +32,83 @@ export default async function handler(req, res) {
     const trendsData = await trendsRes.json();
     let updatedCount = 0;
 
-    // 2. Loop & update harga ke Shopify jika data produk ada
-    if (trendsData && (trendsData.products || Array.isArray(trendsData))) {
-      const productList = trendsData.products || trendsData;
+    // Tangani format data list dari Trends NZ
+    const productList = Array.isArray(trendsData) 
+      ? trendsData 
+      : (trendsData.products || trendsData.data || []);
 
-      for (const item of productList) {
-        if (!item.sku || !item.price) continue;
+    // 2. Loop & update harga ke Shopify
+    for (const item of productList) {
+      // Pembacaan fleksibel untuk nama field SKU & Price dari Trends NZ
+      const sku = item.sku || item.code || item.product_code;
+      const rawPrice = item.price || item.wholesale_price || (item.pricing && item.pricing.wholesale);
 
-        // Cari Variant ID di Shopify via REST API
-        const shopifySearch = await fetch(`https://${SHOPIFY_STORE}/admin/api/2026-01/variants.json?sku=${item.sku}`, {
-          headers: {
-            'X-Shopify-Access-Token': SHOPIFY_TOKEN,
-            'Content-Type': 'application/json'
+      if (!sku || !rawPrice) continue;
+
+      const price = rawPrice.toString();
+
+      // Cari Variant ID di Shopify via GraphQL API (lebih akurat untuk SKU)
+      const graphqlQuery = {
+        query: `
+          query {
+            productVariants(first: 1, query: "sku:${sku}") {
+              edges {
+                node {
+                  id
+                  price
+                }
+              }
+            }
           }
-        });
+        `
+      };
 
-        if (!shopifySearch.ok) continue;
+      const shopifySearch = await fetch(`https://${SHOPIFY_STORE}/admin/api/2026-01/graphql.json`, {
+        method: 'POST',
+        headers: {
+          'X-Shopify-Access-Token': SHOPIFY_TOKEN,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify(graphqlQuery)
+      });
 
-        const shopifyData = await shopifySearch.json();
-        if (shopifyData.variants && shopifyData.variants.length > 0) {
-          const variantId = shopifyData.variants[0].id;
+      if (!shopifySearch.ok) continue;
 
-          // Update harga variant di Shopify
-          await fetch(`https://${SHOPIFY_STORE}/admin/api/2026-01/variants/${variantId}.json`, {
-            method: 'PUT',
+      const shopifyData = await shopifySearch.json();
+      const variants = shopifyData.data?.productVariants?.edges || [];
+
+      if (variants.length > 0) {
+        const variantNode = variants[0].node;
+        const variantId = variantNode.id; // Format GraphQL ID: gid://shopify/ProductVariant/xxxx
+
+        // Update harga jika beda
+        if (variantNode.price !== price) {
+          const updateMutation = {
+            query: `
+              mutation productVariantUpdate($input: ProductVariantInput!) {
+                productVariantUpdate(input: $input) {
+                  productVariant {
+                    id
+                    price
+                  }
+                }
+              }
+            `,
+            variables: {
+              input: {
+                id: variantId,
+                price: price
+              }
+            }
+          };
+
+          await fetch(`https://${SHOPIFY_STORE}/admin/api/2026-01/graphql.json`, {
+            method: 'POST',
             headers: {
               'X-Shopify-Access-Token': SHOPIFY_TOKEN,
               'Content-Type': 'application/json'
             },
-            body: JSON.stringify({
-              variant: {
-                id: variantId,
-                price: item.price
-              }
-            })
+            body: JSON.stringify(updateMutation)
           });
 
           updatedCount++;

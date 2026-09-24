@@ -10,6 +10,7 @@ export default async function handler(req, res) {
       ? TRENDS_TOKEN 
       : `Bearer ${TRENDS_TOKEN}`;
 
+    // 1. Ambil data produk dari Trends NZ
     const trendsRes = await fetch('https://au.api.trends.nz/api/v1/products.json', {
       headers: {
         'Authorization': authHeader,
@@ -35,12 +36,10 @@ export default async function handler(req, res) {
 
     for (const item of productList) {
       const sku = item.code || item.sku;
-      
       let basePrice = null;
 
-      // 1. Ambil harga dari kuantitas terkecil (tier pertama pada array prices)
+      // Ambil harga dari tier quantity paling sedikit (indeks pertama / prices[0])
       if (item.pricing && Array.isArray(item.pricing.prices) && item.pricing.prices.length > 0) {
-        // prices[0] selalu menyimpan kuantitas paling sedikit (MoQ terendah)
         basePrice = item.pricing.prices[0].price;
       } else if (typeof item.price === 'number' || typeof item.price === 'string') {
         basePrice = item.price;
@@ -48,11 +47,11 @@ export default async function handler(req, res) {
 
       if (!sku || basePrice === null || basePrice === undefined) continue;
 
-      // 2. Hitung harga baru dengan Markup 64.5%
+      // Hitung harga akhir dengan markup
       const calculatedPrice = parseFloat(basePrice) * MARKUP_MULTIPLIER;
-      const newPriceStr = calculatedPrice.toFixed(2); // Format 2 desimal standar Shopify
+      const newPriceStr = calculatedPrice.toFixed(2);
 
-      // 3. Cari SKU di Shopify via GraphQL
+      // 2. Cari produk di Shopify berdasarkan SKU
       const graphqlQuery = {
         query: `
           query {
@@ -61,7 +60,9 @@ export default async function handler(req, res) {
                 node {
                   id
                   price
-                  sku
+                  product {
+                    id
+                  }
                 }
               }
             }
@@ -86,11 +87,14 @@ export default async function handler(req, res) {
       if (variants.length > 0) {
         const variantNode = variants[0].node;
         const variantId = variantNode.id;
+        const productId = variantNode.product?.id;
         const currentShopifyPrice = parseFloat(variantNode.price).toFixed(2);
 
-        // Hanya update jika harga Shopify saat ini berbeda dengan harga bertingkat baru
+        // Hanya proses jika ada perbedaan harga
         if (currentShopifyPrice !== newPriceStr) {
-          const updateMutation = {
+          
+          // Step A: Update harga utama pada produk
+          const updatePriceMutation = {
             query: `
               mutation productVariantUpdate($input: ProductVariantInput!) {
                 productVariantUpdate(input: $input) {
@@ -115,15 +119,42 @@ export default async function handler(req, res) {
               'X-Shopify-Access-Token': SHOPIFY_TOKEN,
               'Content-Type': 'application/json'
             },
-            body: JSON.stringify(updateMutation)
+            body: JSON.stringify(updatePriceMutation)
           });
+
+          // Step B: Update tanggal "Updated" pada induk informasi produk di Shopify Admin
+          if (productId) {
+            const touchProductMutation = {
+              query: `
+                mutation productUpdate($input: ProductInput!) {
+                  productUpdate(input: $input) {
+                    product {
+                      id
+                    }
+                  }
+                }
+              `,
+              variables: {
+                input: { id: productId }
+              }
+            };
+
+            await fetch(`https://${SHOPIFY_STORE}/admin/api/2026-01/graphql.json`, {
+              method: 'POST',
+              headers: {
+                'X-Shopify-Access-Token': SHOPIFY_TOKEN,
+                'Content-Type': 'application/json'
+              },
+              body: JSON.stringify(touchProductMutation)
+            });
+          }
 
           if (updateRes.ok) {
             trulyUpdatedList.push({
               sku: sku,
-              harga_modal_trends: basePrice,
-              harga_shopify_lama: currentShopifyPrice,
-              harga_shopify_baru_with_markup: newPriceStr
+              modal_trends_lowest_qty: basePrice,
+              harga_lama: currentShopifyPrice,
+              harga_baru_dengan_markup: newPriceStr
             });
           }
         } else {

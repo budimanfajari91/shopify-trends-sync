@@ -6,26 +6,43 @@ export default async function handler(req, res) {
     let SHOPIFY_STORE = (process.env.SHOPIFY_STORE_URL || '').replace(/^https?:\/\//, '').replace(/\/$/, '');
     const SHOPIFY_TOKEN = process.env.SHOPIFY_ADMIN_TOKEN;
 
-    const authHeader = TRENDS_TOKEN?.startsWith('Bearer') 
-      ? TRENDS_TOKEN 
+    const authHeader = TRENDS_TOKEN?.startsWith('Bearer')
+      ? TRENDS_TOKEN
       : `Bearer ${TRENDS_TOKEN}`;
 
-    // 1. Ambil data produk dari Trends NZ
-    const trendsRes = await fetch('https://au.api.trends.nz/api/v1/products.json', {
-      headers: {
-        'Authorization': authHeader,
-        'Accept': 'application/json'
-      }
-    });
+    // 1. Tarik seluruh produk dari Trends NZ (Melintasi semua halaman)
+    let productList = [];
+    let page = 1;
+    let hasMorePages = true;
 
-    if (!trendsRes.ok) {
-      return res.status(trendsRes.status).json({ success: false, message: 'Gagal mengambil data Trends NZ' });
+    while (hasMorePages) {
+      const trendsRes = await fetch(`https://au.api.trends.nz/api/v1/products.json?page=${page}`, {
+        headers: {
+          'Authorization': authHeader,
+          'Accept': 'application/json'
+        }
+      });
+
+      if (!trendsRes.ok) break;
+
+      const trendsData = await trendsRes.json();
+      const currentBatch = Array.isArray(trendsData)
+        ? trendsData
+        : (trendsData.products || trendsData.data || []);
+
+      if (currentBatch.length === 0) {
+        hasMorePages = false;
+      } else {
+        productList = productList.concat(currentBatch);
+        page++;
+        // Batasi maksimal 10 halaman (1000 produk) untuk mencegah Vercel execution timeout
+        if (page > 10) hasMorePages = false;
+      }
     }
 
-    const trendsData = await trendsRes.json();
-    const productList = Array.isArray(trendsData) 
-      ? trendsData 
-      : (trendsData.products || trendsData.data || []);
+    if (productList.length === 0) {
+      return res.status(200).json({ success: false, message: 'Tidak ada data produk yang ditemukan dari Trends NZ.' });
+    }
 
     let trulyUpdatedList = [];
     let unchangedCount = 0;
@@ -34,11 +51,12 @@ export default async function handler(req, res) {
     // Koefisien Markup: 1 + 0.645 = 1.645 (Markup 64.5%)
     const MARKUP_MULTIPLIER = 1.645;
 
+    // 2. Loop SELURUH produk yang berhasil ditarik
     for (const item of productList) {
       const sku = item.code || item.sku;
       let basePrice = null;
 
-      // Ambil harga dari tier quantity paling sedikit (indeks pertama / prices[0])
+      // Ambil harga kuantitas paling sedikit (prices[0])
       if (item.pricing && Array.isArray(item.pricing.prices) && item.pricing.prices.length > 0) {
         basePrice = item.pricing.prices[0].price;
       } else if (typeof item.price === 'number' || typeof item.price === 'string') {
@@ -47,11 +65,10 @@ export default async function handler(req, res) {
 
       if (!sku || basePrice === null || basePrice === undefined) continue;
 
-      // Hitung harga akhir dengan markup
       const calculatedPrice = parseFloat(basePrice) * MARKUP_MULTIPLIER;
       const newPriceStr = calculatedPrice.toFixed(2);
 
-      // 2. Cari produk di Shopify berdasarkan SKU
+      // Cari SKU di Shopify via GraphQL
       const graphqlQuery = {
         query: `
           query {
@@ -90,10 +107,9 @@ export default async function handler(req, res) {
         const productId = variantNode.product?.id;
         const currentShopifyPrice = parseFloat(variantNode.price).toFixed(2);
 
-        // Hanya proses jika ada perbedaan harga
         if (currentShopifyPrice !== newPriceStr) {
-          
-          // Step A: Update harga utama pada produk
+
+          // Update harga pada varian utama
           const updatePriceMutation = {
             query: `
               mutation productVariantUpdate($input: ProductVariantInput!) {
@@ -122,7 +138,7 @@ export default async function handler(req, res) {
             body: JSON.stringify(updatePriceMutation)
           });
 
-          // Step B: Update tanggal "Updated" pada induk informasi produk di Shopify Admin
+          // Touch induk produk agar status "Updated" di Shopify Admin menjadi "Just now"
           if (productId) {
             const touchProductMutation = {
               query: `
@@ -167,9 +183,10 @@ export default async function handler(req, res) {
 
     return res.status(200).json({
       success: true,
+      total_produk_trends_ditemukan: productList.length,
       total_produk_diubah: trulyUpdatedList.length,
       produk_harga_sudah_sesuai: unchangedCount,
-      sku_tidak_ditemukan: notFoundCount,
+      sku_tidak_ditemukan_di_shopify: notFoundCount,
       detail_update: trulyUpdatedList
     });
 

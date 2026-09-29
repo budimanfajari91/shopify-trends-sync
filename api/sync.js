@@ -6,14 +6,14 @@ export default async function handler(req, res) {
     let SHOPIFY_STORE = (process.env.SHOPIFY_STORE_URL || '').replace(/^https?:\/\//, '').replace(/\/$/, '');
     const SHOPIFY_TOKEN = process.env.SHOPIFY_ADMIN_TOKEN;
 
-    // Membaca parameter page dari URL (Default: page 1)
+    // 1. Ambil parameter page dari URL (Default ke page 1 jika tidak diisi)
     const page = req.query.page || 1;
 
     const authHeader = TRENDS_TOKEN?.startsWith('Bearer') 
       ? TRENDS_TOKEN 
       : `Bearer ${TRENDS_TOKEN}`;
 
-    // 1. Ambil data Trends NZ berdasarkan halaman yang diminta
+    // 2. Terapkan variabel ${page} secara dinamis ke API Trends.nz
     const trendsRes = await fetch(`https://au.api.trends.nz/api/v1/products.json?page=${page}`, {
       headers: {
         'Authorization': authHeader,
@@ -36,7 +36,7 @@ export default async function handler(req, res) {
 
     const MARKUP_MULTIPLIER = 1.645; // Markup 64.5%
 
-    // 2. Pemrosesan Paralel Cepat
+    // 3. Pemrosesan Paralel Cepat
     const processTasks = productList.map(async (item) => {
       const sku = item.code || item.sku;
       let basePrice = null;

@@ -6,12 +6,15 @@ export default async function handler(req, res) {
     let SHOPIFY_STORE = (process.env.SHOPIFY_STORE_URL || '').replace(/^https?:\/\//, '').replace(/\/$/, '');
     const SHOPIFY_TOKEN = process.env.SHOPIFY_ADMIN_TOKEN;
 
+    // Membaca parameter page dari URL (Default: page 1)
+    const page = req.query.page || 1;
+
     const authHeader = TRENDS_TOKEN?.startsWith('Bearer') 
       ? TRENDS_TOKEN 
       : `Bearer ${TRENDS_TOKEN}`;
 
-    // 1. Ambil data dari Trends NZ (100 produk per panggilan agar ringan)
-    const trendsRes = await fetch('https://au.api.trends.nz/api/v1/products.json?page=1', {
+    // 1. Ambil data Trends NZ berdasarkan halaman yang diminta
+    const trendsRes = await fetch(`https://au.api.trends.nz/api/v1/products.json?page=${page}`, {
       headers: {
         'Authorization': authHeader,
         'Accept': 'application/json'
@@ -19,7 +22,7 @@ export default async function handler(req, res) {
     });
 
     if (!trendsRes.ok) {
-      return res.status(trendsRes.status).json({ success: false, message: 'Gagal mengambil data Trends NZ' });
+      return res.status(trendsRes.status).json({ success: false, message: `Gagal mengambil data Trends NZ halaman ${page}` });
     }
 
     const trendsData = await trendsRes.json();
@@ -27,15 +30,19 @@ export default async function handler(req, res) {
       ? trendsData 
       : (trendsData.products || trendsData.data || []);
 
-    const MARKUP_MULTIPLIER = 1.645; // Markup 64.5% (naik 50% dari base 43%)
+    if (productList.length === 0) {
+      return res.status(200).json({ success: true, message: `Tidak ada data produk di halaman ${page}` });
+    }
 
-    // 2. Olah data produk & siapkan tugas pemrosesan paralel
+    const MARKUP_MULTIPLIER = 1.645; // Markup 64.5%
+
+    // 2. Pemrosesan Paralel Cepat
     const processTasks = productList.map(async (item) => {
       const sku = item.code || item.sku;
       let basePrice = null;
 
       if (item.pricing && Array.isArray(item.pricing.prices) && item.pricing.prices.length > 0) {
-        basePrice = item.pricing.prices[0].price; // Kuantitas terkecil
+        basePrice = item.pricing.prices[0].price;
       } else if (typeof item.price === 'number' || typeof item.price === 'string') {
         basePrice = item.price;
       }
@@ -45,7 +52,6 @@ export default async function handler(req, res) {
       const calculatedPrice = parseFloat(basePrice) * MARKUP_MULTIPLIER;
       const newPriceStr = calculatedPrice.toFixed(2);
 
-      // Cari SKU di Shopify
       const graphqlQuery = {
         query: `
           query {
@@ -83,7 +89,6 @@ export default async function handler(req, res) {
         const currentShopifyPrice = parseFloat(variantNode.price).toFixed(2);
 
         if (currentShopifyPrice !== newPriceStr) {
-          // Update Harga
           const updatePriceMutation = {
             query: `
               mutation productVariantUpdate($input: ProductVariantInput!) {
@@ -104,7 +109,6 @@ export default async function handler(req, res) {
             body: JSON.stringify(updatePriceMutation)
           });
 
-          // Touch Induk Produk
           if (productId) {
             const touchProductMutation = {
               query: `
@@ -138,16 +142,15 @@ export default async function handler(req, res) {
       return { status: 'not_found', sku };
     });
 
-    // Jalankan seluruh pemrosesan secara serentak (paralel)
     const results = await Promise.all(processTasks);
 
-    // Evaluasi ringkasan hasil
     const trulyUpdated = results.filter(r => r && r.status === 'updated');
     const unchangedCount = results.filter(r => r && r.status === 'unchanged').length;
     const notFoundCount = results.filter(r => r && r.status === 'not_found').length;
 
     return res.status(200).json({
       success: true,
+      halaman_saat_ini: parseInt(page),
       total_diproses: productList.length,
       total_produk_diubah: trulyUpdated.length,
       produk_harga_sudah_sesuai: unchangedCount,

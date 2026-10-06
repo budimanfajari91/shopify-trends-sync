@@ -1,7 +1,11 @@
 {
   "name": "shopify-trends-sync",
   "version": "1.0.0",
+  "private": true,
   "type": "module",
+  "scripts": {
+    "start": "node api/sync.js"
+  },
   "dependencies": {
     "node-fetch": "^3.3.2"
   }

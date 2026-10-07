@@ -12,8 +12,8 @@ export default async function handler(req, res) {
       ? TRENDS_TOKEN 
       : `Bearer ${TRENDS_TOKEN}`;
 
-    // 1. Ambil data dari Trends NZ per halaman
-    const trendsRes = await fetch(`https://au.api.trends.nz/api/v1/products.json?page=${page}&per_page=250`, {
+    // 1. Ambil data Trends.nz per halaman
+    const trendsRes = await fetch(`https://au.api.trends.nz/api/v1/products.json?page=${page}`, {
       headers: {
         'Authorization': authHeader,
         'Accept': 'application/json'
@@ -35,14 +35,16 @@ export default async function handler(req, res) {
 
     const MARKUP_MULTIPLIER = 1.645; // Markup 64.5%
 
-    // 2. Pemrosesan paralel dengan pemetaan struktur SKU/Harga fleksibel
-    const processTasks = productList.map(async (item) => {
-      // Ambil SKU (Cek code, sku, atau item_code)
+    // 2. Tahap Pencarian: Cari varian di Shopify & kumpulkan perubahan berdasarkan productId
+    const updatesByProduct = {}; 
+    let unchangedCount = 0;
+    let notFoundCount = 0;
+    let skippedCount = 0;
+
+    const searchTasks = productList.map(async (item) => {
       const sku = item.code || item.sku || item.item_code;
-      
       let basePrice = null;
 
-      // Cek struktur pricing.prices
       if (item.pricing && Array.isArray(item.pricing.prices) && item.pricing.prices.length > 0) {
         basePrice = item.pricing.prices[0].price ?? item.pricing.prices[0].unit_price;
       } else if (Array.isArray(item.prices) && item.prices.length > 0) {
@@ -51,7 +53,6 @@ export default async function handler(req, res) {
         basePrice = item.price;
       }
 
-      // Jika SKU atau Harga modal tidak valid, lewati
       if (!sku || basePrice === null || basePrice === undefined) {
         return { status: 'skipped' };
       }
@@ -59,7 +60,6 @@ export default async function handler(req, res) {
       const calculatedPrice = parseFloat(basePrice) * MARKUP_MULTIPLIER;
       const newPriceStr = calculatedPrice.toFixed(2);
 
-      // Cari SKU di Shopify via GraphQL
       const graphqlQuery = {
         query: `
           query {
@@ -97,75 +97,102 @@ export default async function handler(req, res) {
         const currentShopifyPrice = parseFloat(variantNode.price).toFixed(2);
 
         if (currentShopifyPrice !== newPriceStr) {
-          const updatePriceMutation = {
-            query: `
-              mutation productVariantUpdate($input: ProductVariantInput!) {
-                productVariantUpdate(input: $input) {
-                  productVariant { id price }
-                }
-              }
-            `,
-            variables: { input: { id: variantId, price: newPriceStr } }
-          };
-
-          await fetch(`https://${SHOPIFY_STORE}/admin/api/2026-01/graphql.json`, {
-            method: 'POST',
-            headers: {
-              'X-Shopify-Access-Token': SHOPIFY_TOKEN,
-              'Content-Type': 'application/json'
-            },
-            body: JSON.stringify(updatePriceMutation)
-          });
-
-          if (productId) {
-            const touchProductMutation = {
-              query: `
-                mutation productUpdate($input: ProductInput!) {
-                  productUpdate(input: $input) { product { id } }
-                }
-              `,
-              variables: { input: { id: productId } }
-            };
-
-            await fetch(`https://${SHOPIFY_STORE}/admin/api/2026-01/graphql.json`, {
-              method: 'POST',
-              headers: {
-                'X-Shopify-Access-Token': SHOPIFY_TOKEN,
-                'Content-Type': 'application/json'
-              },
-              body: JSON.stringify(touchProductMutation)
-            });
-          }
-
           return {
-            status: 'updated',
+            status: 'needs_update',
+            productId,
+            variantId,
             sku,
-            modal_trends: basePrice,
-            harga_lama: currentShopifyPrice,
-            harga_baru: newPriceStr
+            basePrice,
+            currentShopifyPrice,
+            newPriceStr
           };
         }
-        return { status: 'unchanged', sku };
+        return { status: 'unchanged' };
       }
-      return { status: 'not_found', sku };
+      return { status: 'not_found' };
     });
 
-    const results = await Promise.all(processTasks);
+    const searchResults = await Promise.all(searchTasks);
 
-    const trulyUpdated = results.filter(r => r && r.status === 'updated');
-    const unchangedCount = results.filter(r => r && r.status === 'unchanged').length;
-    const notFoundCount = results.filter(r => r && r.status === 'not_found').length;
-    const skippedCount = results.filter(r => r && r.status === 'skipped').length;
+    // Grouping item yang butuh diupdate berdasarkan productId
+    searchResults.forEach((res) => {
+      if (res && res.status === 'needs_update') {
+        if (!updatesByProduct[res.productId]) {
+          updatesByProduct[res.productId] = [];
+        }
+        updatesByProduct[res.productId].push(res);
+      } else if (res && res.status === 'unchanged') {
+        unchangedCount++;
+      } else if (res && res.status === 'not_found') {
+        notFoundCount++;
+      } else if (res && res.status === 'skipped') {
+        skippedCount++;
+      }
+    });
+
+    // 3. Tahap Update: Jalankan productVariantsBulkUpdate per produk
+    const bulkUpdateTasks = Object.keys(updatesByProduct).map(async (productId) => {
+      const itemsToUpdate = updatesByProduct[productId];
+
+      const variantsInput = itemsToUpdate.map((item) => ({
+        id: item.variantId,
+        price: item.newPriceStr
+      }));
+
+      const bulkMutation = {
+        query: `
+          mutation productVariantsBulkUpdate($productId: ID!, $variants: [ProductVariantsBulkInput!]!) {
+            productVariantsBulkUpdate(productId: $productId, variants: $variants) {
+              productVariants {
+                id
+                price
+              }
+              userErrors {
+                field
+                message
+              }
+            }
+          }
+        `,
+        variables: {
+          productId: productId,
+          variants: variantsInput
+        }
+      };
+
+      const updateRes = await fetch(`https://${SHOPIFY_STORE}/admin/api/2026-01/graphql.json`, {
+        method: 'POST',
+        headers: {
+          'X-Shopify-Access-Token': SHOPIFY_TOKEN,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify(bulkMutation)
+      });
+
+      if (updateRes.ok) {
+        return itemsToUpdate.map((item) => ({
+          sku: item.sku,
+          modal_trends: item.basePrice,
+          harga_lama: item.currentShopifyPrice,
+          harga_baru: item.newPriceStr
+        }));
+      }
+      return [];
+    });
+
+    const bulkResults = await Promise.all(bulkUpdateTasks);
+    const trulyUpdatedList = bulkResults.flat();
 
     return res.status(200).json({
       success: true,
+      metode: 'productVariantsBulkUpdate',
       halaman_saat_ini: parseInt(page),
       total_diproses: productList.length,
-      total_produk_diubah: trulyUpdated.length,
+      total_produk_diubah: trulyUpdatedList.length,
       produk_harga_sudah_sesuai: unchangedCount,
       sku_tidak_ditemukan: notFoundCount,
       produk_dilewati: skippedCount,
-      detail_update: trulyUpdated
+      detail_update: trulyUpdatedList
     });
 
   } catch (error) {

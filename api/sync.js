@@ -13,7 +13,7 @@ export default async function handler(req, res) {
       : `Bearer ${TRENDS_TOKEN}`;
 
     // 1. Ambil data dari Trends NZ per halaman
-    const trendsRes = await fetch(`https://au.api.trends.nz/api/v1/products.json?page=${page}`, {
+    const trendsRes = await fetch(`https://au.api.trends.nz/api/v1/products.json?page=${page}&per_page=250`, {
       headers: {
         'Authorization': authHeader,
         'Accept': 'application/json'

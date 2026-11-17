@@ -1,6 +1,5 @@
 import fetch from 'node-fetch';
 
-// Helper untuk membersihkan format URL toko Shopify
 function normalizeShopifyDomain(rawUrl = '') {
   let clean = rawUrl.trim().replace(/^https?:\/\//, '').replace(/\/$/, '');
   const adminMatch = clean.match(/^admin\.shopify\.com\/store\/([^/]+)/);
@@ -10,7 +9,6 @@ function normalizeShopifyDomain(rawUrl = '') {
   return clean;
 }
 
-// Helper jeda waktu untuk menghindari rate limit
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 export default async function handler(req, res) {
@@ -26,10 +24,45 @@ export default async function handler(req, res) {
       });
     }
 
-    const page = parseInt(req.query.page || '1', 10);
     const authHeader = TRENDS_TOKEN.startsWith('Bearer')
       ? TRENDS_TOKEN
       : `Bearer ${TRENDS_TOKEN}`;
+
+    // MODE INSPEKSI: Buka /api/sync?inspect=1 untuk mengecek struktur & parameter paginasi Trends.nz
+    if (req.query.inspect === '1') {
+      const headers = { 'Authorization': authHeader, 'Accept': 'application/json' };
+      const [resDefault, resOffset, resStart, resPageSize] = await Promise.all([
+        fetch('https://au.api.trends.nz/api/v1/products.json', { headers }),
+        fetch('https://au.api.trends.nz/api/v1/products.json?offset=100', { headers }),
+        fetch('https://au.api.trends.nz/api/v1/products.json?start=100', { headers }),
+        fetch('https://au.api.trends.nz/api/v1/products.json?page_size=250', { headers })
+      ]);
+
+      const dataDefault = await resDefault.json();
+      const dataOffset = await resOffset.json();
+      const dataStart = await resStart.json();
+      const dataPageSize = await resPageSize.json();
+
+      const extractList = (d) => Array.isArray(d) ? d : (d.products || d.data || []);
+      const metadata = {};
+      if (!Array.isArray(dataDefault) && typeof dataDefault === 'object' && dataDefault !== null) {
+        for (const [k, v] of Object.entries(dataDefault)) {
+          if (!Array.isArray(v)) metadata[k] = v;
+        }
+      }
+
+      return res.status(200).json({
+        tipe_root_json: Array.isArray(dataDefault) ? 'array' : 'object',
+        metadata_root_trends: metadata,
+        jumlah_item_default: extractList(dataDefault).length,
+        kode_pertama_default: extractList(dataDefault)[0]?.code ?? null,
+        kode_pertama_dengan_offset_100: extractList(dataOffset)[0]?.code ?? null,
+        kode_pertama_dengan_start_100: extractList(dataStart)[0]?.code ?? null,
+        jumlah_item_dengan_page_size_250: extractList(dataPageSize).length
+      });
+    }
+
+    const page = parseInt(req.query.page || '1', 10);
 
     // 1. Ambil data Trends.nz per halaman
     const trendsRes = await fetch(`https://au.api.trends.nz/api/v1/products.json?page=${page}`, {
@@ -60,7 +93,7 @@ export default async function handler(req, res) {
       });
     }
 
-    const MARKUP_MULTIPLIER = 1.645; // Markup 64.5%
+    const MARKUP_MULTIPLIER = 1.645;
     const updatesByProduct = {};
     let unchangedCount = 0;
     let notFoundCount = 0;
@@ -69,7 +102,6 @@ export default async function handler(req, res) {
     const sampleErrors = [];
     const sampleSkipped = [];
 
-    // Fungsi proses per 1 produk Trends.nz
     const processItem = async (item) => {
       const sku = (item.code || item.sku || item.item_code || '').toString().trim();
       let basePrice = null;
@@ -92,7 +124,6 @@ export default async function handler(req, res) {
       const calculatedPrice = parseFloat(basePrice) * MARKUP_MULTIPLIER;
       const newPriceStr = calculatedPrice.toFixed(2);
 
-      // Gunakan variables GraphQL & ambil first: 10 untuk mencocokkan SKU secara persis
       const graphqlQuery = {
         query: `
           query findVariantBySku($query: String!) {
@@ -140,7 +171,6 @@ export default async function handler(req, res) {
       }
 
       const edges = shopifyData.data?.productVariants?.edges || [];
-      // Pastikan SKU cocok persis (case-insensitive), bukan sekadar awalan
       const exactMatch = edges.find(
         (edge) => (edge.node.sku || '').trim().toLowerCase() === sku.toLowerCase()
       );
@@ -168,7 +198,6 @@ export default async function handler(req, res) {
       return { status: 'not_found' };
     };
 
-    // 2. Jalankan pencarian dalam batch berisi 5 produk agar aman dari rate limit Shopify
     const BATCH_SIZE = 5;
     const searchResults = [];
 
@@ -178,11 +207,10 @@ export default async function handler(req, res) {
       searchResults.push(...batchResults);
 
       if (i + BATCH_SIZE < productList.length) {
-        await sleep(250); // Jeda 250ms antar batch
+        await sleep(250);
       }
     }
 
-    // Rekap hasil pencarian
     searchResults.forEach((result) => {
       if (!result) return;
 
@@ -204,7 +232,6 @@ export default async function handler(req, res) {
       }
     });
 
-    // 3. Tahap Update: Jalankan productVariantsBulkUpdate per produk
     const trulyUpdatedList = [];
     const updateErrors = [];
 

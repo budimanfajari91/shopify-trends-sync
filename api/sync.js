@@ -1,15 +1,34 @@
 import fetch from 'node-fetch';
 
+// Helper untuk membersihkan format URL toko Shopify
+function normalizeShopifyDomain(rawUrl = '') {
+  let clean = rawUrl.trim().replace(/^https?:\/\//, '').replace(/\/$/, '');
+  const adminMatch = clean.match(/^admin\.shopify\.com\/store\/([^/]+)/);
+  if (adminMatch) {
+    return `${adminMatch[1]}.myshopify.com`;
+  }
+  return clean;
+}
+
+// Helper jeda waktu untuk menghindari rate limit
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
 export default async function handler(req, res) {
   try {
     const TRENDS_TOKEN = process.env.TRENDS_API_TOKEN;
-    let SHOPIFY_STORE = (process.env.SHOPIFY_STORE_URL || '').replace(/^https?:\/\//, '').replace(/\/$/, '');
+    const SHOPIFY_STORE = normalizeShopifyDomain(process.env.SHOPIFY_STORE_URL);
     const SHOPIFY_TOKEN = process.env.SHOPIFY_ADMIN_TOKEN;
 
-    const page = req.query.page || 1;
+    if (!TRENDS_TOKEN || !SHOPIFY_STORE || !SHOPIFY_TOKEN) {
+      return res.status(400).json({
+        success: false,
+        message: 'Environment variables (TRENDS_API_TOKEN, SHOPIFY_STORE_URL, SHOPIFY_ADMIN_TOKEN) belum lengkap.'
+      });
+    }
 
-    const authHeader = TRENDS_TOKEN?.startsWith('Bearer') 
-      ? TRENDS_TOKEN 
+    const page = parseInt(req.query.page || '1', 10);
+    const authHeader = TRENDS_TOKEN.startsWith('Bearer')
+      ? TRENDS_TOKEN
       : `Bearer ${TRENDS_TOKEN}`;
 
     // 1. Ambil data Trends.nz per halaman
@@ -21,28 +40,38 @@ export default async function handler(req, res) {
     });
 
     if (!trendsRes.ok) {
-      return res.status(trendsRes.status).json({ success: false, message: `Gagal mengambil data Trends NZ halaman ${page}` });
+      const errText = await trendsRes.text();
+      return res.status(trendsRes.status).json({
+        success: false,
+        message: `Gagal mengambil data Trends NZ halaman ${page}`,
+        detail: errText.slice(0, 300)
+      });
     }
 
     const trendsData = await trendsRes.json();
-    const productList = Array.isArray(trendsData) 
-      ? trendsData 
+    const productList = Array.isArray(trendsData)
+      ? trendsData
       : (trendsData.products || trendsData.data || []);
 
     if (productList.length === 0) {
-      return res.status(200).json({ success: true, message: `Tidak ada data produk di halaman ${page}` });
+      return res.status(200).json({
+        success: true,
+        message: `Tidak ada data produk di halaman ${page}`
+      });
     }
 
     const MARKUP_MULTIPLIER = 1.645; // Markup 64.5%
-
-    // 2. Tahap Pencarian: Cari varian di Shopify & kumpulkan perubahan berdasarkan productId
-    const updatesByProduct = {}; 
+    const updatesByProduct = {};
     let unchangedCount = 0;
     let notFoundCount = 0;
     let skippedCount = 0;
+    let errorCount = 0;
+    const sampleErrors = [];
+    const sampleSkipped = [];
 
-    const searchTasks = productList.map(async (item) => {
-      const sku = item.code || item.sku || item.item_code;
+    // Fungsi proses per 1 produk Trends.nz
+    const processItem = async (item) => {
+      const sku = (item.code || item.sku || item.item_code || '').toString().trim();
       let basePrice = null;
 
       if (item.pricing && Array.isArray(item.pricing.prices) && item.pricing.prices.length > 0) {
@@ -53,27 +82,35 @@ export default async function handler(req, res) {
         basePrice = item.price;
       }
 
-      if (!sku || basePrice === null || basePrice === undefined) {
-        return { status: 'skipped' };
+      if (!sku || basePrice === null || basePrice === undefined || isNaN(parseFloat(basePrice))) {
+        return {
+          status: 'skipped',
+          debug: { code: item.code, name: item.name, pricing: item.pricing || item.prices || item.price }
+        };
       }
 
       const calculatedPrice = parseFloat(basePrice) * MARKUP_MULTIPLIER;
       const newPriceStr = calculatedPrice.toFixed(2);
 
+      // Gunakan variables GraphQL & ambil first: 10 untuk mencocokkan SKU secara persis
       const graphqlQuery = {
         query: `
-          query {
-            productVariants(first: 1, query: "sku:${sku}") {
+          query findVariantBySku($query: String!) {
+            productVariants(first: 10, query: $query) {
               edges {
                 node {
                   id
+                  sku
                   price
                   product { id }
                 }
               }
             }
           }
-        `
+        `,
+        variables: {
+          query: `sku:"${sku}"`
+        }
       };
 
       const shopifySearch = await fetch(`https://${SHOPIFY_STORE}/admin/api/2026-01/graphql.json`, {
@@ -85,13 +122,31 @@ export default async function handler(req, res) {
         body: JSON.stringify(graphqlQuery)
       });
 
-      if (!shopifySearch.ok) return { status: 'error' };
+      if (!shopifySearch.ok) {
+        const text = await shopifySearch.text();
+        return {
+          status: 'error',
+          reason: `HTTP ${shopifySearch.status} (${SHOPIFY_STORE}): ${text.slice(0, 200)}`
+        };
+      }
 
       const shopifyData = await shopifySearch.json();
-      const variants = shopifyData.data?.productVariants?.edges || [];
 
-      if (variants.length > 0) {
-        const variantNode = variants[0].node;
+      if (shopifyData.errors && shopifyData.errors.length > 0) {
+        return {
+          status: 'error',
+          reason: `GraphQL Error: ${shopifyData.errors[0].message}`
+        };
+      }
+
+      const edges = shopifyData.data?.productVariants?.edges || [];
+      // Pastikan SKU cocok persis (case-insensitive), bukan sekadar awalan
+      const exactMatch = edges.find(
+        (edge) => (edge.node.sku || '').trim().toLowerCase() === sku.toLowerCase()
+      );
+
+      if (exactMatch) {
+        const variantNode = exactMatch.node;
         const variantId = variantNode.id;
         const productId = variantNode.product?.id;
         const currentShopifyPrice = parseFloat(variantNode.price).toFixed(2);
@@ -109,31 +164,52 @@ export default async function handler(req, res) {
         }
         return { status: 'unchanged' };
       }
+
       return { status: 'not_found' };
-    });
+    };
 
-    const searchResults = await Promise.all(searchTasks);
+    // 2. Jalankan pencarian dalam batch berisi 5 produk agar aman dari rate limit Shopify
+    const BATCH_SIZE = 5;
+    const searchResults = [];
 
-    // Grouping item yang butuh diupdate berdasarkan productId
-    searchResults.forEach((res) => {
-      if (res && res.status === 'needs_update') {
-        if (!updatesByProduct[res.productId]) {
-          updatesByProduct[res.productId] = [];
+    for (let i = 0; i < productList.length; i += BATCH_SIZE) {
+      const batch = productList.slice(i, i + BATCH_SIZE);
+      const batchResults = await Promise.all(batch.map(processItem));
+      searchResults.push(...batchResults);
+
+      if (i + BATCH_SIZE < productList.length) {
+        await sleep(250); // Jeda 250ms antar batch
+      }
+    }
+
+    // Rekap hasil pencarian
+    searchResults.forEach((result) => {
+      if (!result) return;
+
+      if (result.status === 'needs_update') {
+        if (!updatesByProduct[result.productId]) {
+          updatesByProduct[result.productId] = [];
         }
-        updatesByProduct[res.productId].push(res);
-      } else if (res && res.status === 'unchanged') {
+        updatesByProduct[result.productId].push(result);
+      } else if (result.status === 'unchanged') {
         unchangedCount++;
-      } else if (res && res.status === 'not_found') {
+      } else if (result.status === 'not_found') {
         notFoundCount++;
-      } else if (res && res.status === 'skipped') {
+      } else if (result.status === 'skipped') {
         skippedCount++;
+        if (sampleSkipped.length < 3) sampleSkipped.push(result.debug);
+      } else if (result.status === 'error') {
+        errorCount++;
+        if (sampleErrors.length < 3) sampleErrors.push(result.reason);
       }
     });
 
     // 3. Tahap Update: Jalankan productVariantsBulkUpdate per produk
-    const bulkUpdateTasks = Object.keys(updatesByProduct).map(async (productId) => {
-      const itemsToUpdate = updatesByProduct[productId];
+    const trulyUpdatedList = [];
+    const updateErrors = [];
 
+    for (const productId of Object.keys(updatesByProduct)) {
+      const itemsToUpdate = updatesByProduct[productId];
       const variantsInput = itemsToUpdate.map((item) => ({
         id: item.variantId,
         price: item.newPriceStr
@@ -155,7 +231,7 @@ export default async function handler(req, res) {
           }
         `,
         variables: {
-          productId: productId,
+          productId,
           variants: variantsInput
         }
       };
@@ -169,29 +245,41 @@ export default async function handler(req, res) {
         body: JSON.stringify(bulkMutation)
       });
 
-      if (updateRes.ok) {
-        return itemsToUpdate.map((item) => ({
-          sku: item.sku,
-          modal_trends: item.basePrice,
-          harga_lama: item.currentShopifyPrice,
-          harga_baru: item.newPriceStr
-        }));
-      }
-      return [];
-    });
+      const updateData = await updateRes.json();
+      const userErrors = updateData.data?.productVariantsBulkUpdate?.userErrors || [];
 
-    const bulkResults = await Promise.all(bulkUpdateTasks);
-    const trulyUpdatedList = bulkResults.flat();
+      if (!updateRes.ok || updateData.errors || userErrors.length > 0) {
+        updateErrors.push({
+          productId,
+          errors: updateData.errors || userErrors
+        });
+      } else {
+        itemsToUpdate.forEach((item) => {
+          trulyUpdatedList.push({
+            sku: item.sku,
+            modal_trends: item.basePrice,
+            harga_lama: item.currentShopifyPrice,
+            harga_baru: item.newPriceStr
+          });
+        });
+      }
+
+      await sleep(200);
+    }
 
     return res.status(200).json({
       success: true,
-      metode: 'productVariantsBulkUpdate',
-      halaman_saat_ini: parseInt(page),
+      shopify_domain_terpakai: SHOPIFY_STORE,
+      halaman_saat_ini: page,
       total_diproses: productList.length,
       total_produk_diubah: trulyUpdatedList.length,
       produk_harga_sudah_sesuai: unchangedCount,
       sku_tidak_ditemukan: notFoundCount,
       produk_dilewati: skippedCount,
+      total_error: errorCount,
+      contoh_error: sampleErrors,
+      contoh_dilewati: sampleSkipped,
+      error_saat_update: updateErrors,
       detail_update: trulyUpdatedList
     });
 

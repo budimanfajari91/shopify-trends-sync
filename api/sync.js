@@ -11,7 +11,52 @@ function normalizeShopifyDomain(rawUrl = '') {
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-// Helper untuk mengambil 1 halaman Trends.nz & mendeteksi parameter halaman yang valid
+// Mengambil harga modal dari tier QUANTITY PALING RENDAH
+function getLowestQuantityTier(item) {
+  let tiers = null;
+  if (item.pricing && Array.isArray(item.pricing.prices) && item.pricing.prices.length > 0) {
+    tiers = item.pricing.prices;
+  } else if (Array.isArray(item.prices) && item.prices.length > 0) {
+    tiers = item.prices;
+  }
+
+  if (tiers) {
+    const validTiers = tiers
+      .map((t) => {
+        const rawPrice = t.price ?? t.unit_price;
+        const price = rawPrice !== undefined && rawPrice !== null ? parseFloat(rawPrice) : NaN;
+        const rawQty = t.quantity ?? t.qty ?? t.min_qty ?? t.min_quantity;
+        const qty = rawQty !== undefined && rawQty !== null ? parseFloat(rawQty) : NaN;
+        return { qty, price };
+      })
+      .filter((t) => !isNaN(t.price) && t.price > 0);
+
+    if (validTiers.length > 0) {
+      // Urutkan dari quantity paling kecil; jika field qty tidak tersedia, ambil harga tertinggi (tier terendah)
+      validTiers.sort((a, b) => {
+        const aHasQty = !isNaN(a.qty) && a.qty > 0;
+        const bHasQty = !isNaN(b.qty) && b.qty > 0;
+        if (aHasQty && bHasQty) return a.qty - b.qty;
+        if (aHasQty) return -1;
+        if (bHasQty) return 1;
+        return b.price - a.price;
+      });
+
+      return {
+        qty: !isNaN(validTiers[0].qty) ? validTiers[0].qty : null,
+        basePrice: validTiers[0].price
+      };
+    }
+  }
+
+  if (item.price !== undefined && item.price !== null && !isNaN(parseFloat(item.price)) && parseFloat(item.price) > 0) {
+    return { qty: 1, basePrice: parseFloat(item.price) };
+  }
+
+  return null;
+}
+
+// Helper mengambil 1 halaman Trends.nz
 async function fetchTrendsPage(pageNum, pageSize, authHeader, cachedParam = null) {
   const headers = {
     'Authorization': authHeader,
@@ -35,10 +80,9 @@ async function fetchTrendsPage(pageNum, pageSize, authHeader, cachedParam = null
     return { ...extract(data), usedParam: cachedParam };
   }
 
-  // Coba parameter halaman yang valid (page_current, page_no, page, p)
   const candidates = cachedParam
     ? [cachedParam]
-    : ['page_current', 'page_no', 'page', 'p'];
+    : ['page_no', 'page_current', 'page', 'p'];
 
   for (const param of candidates) {
     const res = await fetch(
@@ -49,7 +93,6 @@ async function fetchTrendsPage(pageNum, pageSize, authHeader, cachedParam = null
     const data = await res.json();
     const parsed = extract(data);
 
-    // Pastikan server benar-benar pindah ke halaman yang diminta
     if (parsed.pageCurrent === pageNum || candidates.length === 1) {
       return { ...parsed, usedParam: param };
     }
@@ -58,7 +101,7 @@ async function fetchTrendsPage(pageNum, pageSize, authHeader, cachedParam = null
   throw new Error(`Parameter paginasi Trends.nz untuk halaman ${pageNum} tidak dikenali.`);
 }
 
-// Helper mencari ratusan SKU di Shopify sekaligus (50 SKU per 1 request GraphQL)
+// Helper mencari SKU di Shopify secara batch (50 SKU per query GraphQL)
 async function lookupShopifyVariantsBatch(skus, storeDomain, token) {
   const skuMap = new Map();
   if (skus.length === 0) return skuMap;
@@ -135,7 +178,7 @@ async function lookupShopifyVariantsBatch(skus, storeDomain, token) {
 
 export default async function handler(req, res) {
   const startTime = Date.now();
-  const TIME_BUDGET_MS = 7000; // Berhenti aman di 7 detik agar tidak terkena timeout 10 detik Vercel
+  const TIME_BUDGET_MS = 7000;
 
   try {
     const TRENDS_TOKEN = process.env.TRENDS_API_TOKEN;
@@ -157,7 +200,7 @@ export default async function handler(req, res) {
     const isAutoBrowser = req.query.auto === '1';
     const isCron = req.query.cron === '1';
     const PAGE_SIZE = 250;
-    const MARKUP_MULTIPLIER = 1.645; // Markup 64.5%
+    const MARKUP_MULTIPLIER = 1.50; // Markup 50% pada quantity paling rendah
 
     let currentPage = startPage;
     let totalPages = startPage;
@@ -172,7 +215,6 @@ export default async function handler(req, res) {
     const updatedDetails = [];
     const updateErrors = [];
 
-    // Proses halaman demi halaman selama waktu eksekusi masih di bawah 7 detik
     while (currentPage <= totalPages) {
       if (currentPage > startPage && Date.now() - startTime > TIME_BUDGET_MS) {
         break;
@@ -194,23 +236,14 @@ export default async function handler(req, res) {
 
       totalTrendsChecked += items.length;
 
-      // Kumpulkan SKU valid dari halaman ini
       const validProducts = [];
       const uniqueSkus = new Set();
 
       for (const item of items) {
         const sku = (item.code || item.sku || item.item_code || '').toString().trim();
-        let basePrice = null;
+        const lowestTier = getLowestQuantityTier(item);
 
-        if (item.pricing && Array.isArray(item.pricing.prices) && item.pricing.prices.length > 0) {
-          basePrice = item.pricing.prices[0].price ?? item.pricing.prices[0].unit_price;
-        } else if (Array.isArray(item.prices) && item.prices.length > 0) {
-          basePrice = item.prices[0].price ?? item.prices[0].unit_price;
-        } else if (item.price !== undefined && item.price !== null) {
-          basePrice = item.price;
-        }
-
-        if (!sku || basePrice === null || basePrice === undefined || isNaN(parseFloat(basePrice))) {
+        if (!sku || !lowestTier) {
           totalSkippedNoPrice++;
           continue;
         }
@@ -222,19 +255,18 @@ export default async function handler(req, res) {
         validProducts.push({
           sku,
           skuLower,
-          basePrice,
-          newPriceStr: (parseFloat(basePrice) * MARKUP_MULTIPLIER).toFixed(2)
+          minQty: lowestTier.qty,
+          basePrice: lowestTier.basePrice,
+          newPriceStr: (lowestTier.basePrice * MARKUP_MULTIPLIER).toFixed(2)
         });
       }
 
-      // Cari seluruh SKU halaman ini di Shopify secara batch
       const shopifySkuMap = await lookupShopifyVariantsBatch(
         validProducts.map((p) => p.sku),
         SHOPIFY_STORE,
         SHOPIFY_TOKEN
       );
 
-      // Kelompokkan varian yang harganya berbeda berdasarkan productId
       const updatesByProduct = {};
       for (const prod of validProducts) {
         const matches = shopifySkuMap.get(prod.skuLower);
@@ -251,6 +283,7 @@ export default async function handler(req, res) {
             updatesByProduct[variant.productId].push({
               variantId: variant.variantId,
               sku: prod.sku,
+              minQty: prod.minQty,
               basePrice: prod.basePrice,
               currentShopifyPrice: variant.currentPrice,
               newPriceStr: prod.newPriceStr
@@ -261,7 +294,6 @@ export default async function handler(req, res) {
         }
       }
 
-      // Eksekusi bulk update dalam batch 5 produk paralel
       const productIds = Object.keys(updatesByProduct);
       for (let i = 0; i < productIds.length; i += 5) {
         const batchProductIds = productIds.slice(i, i + 5);
@@ -310,6 +342,7 @@ export default async function handler(req, res) {
                 if (updatedDetails.length < 50) {
                   updatedDetails.push({
                     sku: item.sku,
+                    qty_terendah: item.minQty,
                     modal_trends: item.basePrice,
                     harga_lama: item.currentShopifyPrice,
                     harga_baru: item.newPriceStr
@@ -331,7 +364,6 @@ export default async function handler(req, res) {
     const paramQuery = detectedPageParam ? `&p_param=${detectedPageParam}` : '';
     const nextUrl = `${protocol}://${host}/api/sync?page=${currentPage}${paramQuery}`;
 
-    // Jika mode Cron dan belum selesai, panggil batch berikutnya di background
     if (isCron && !isFinished && host) {
       const nextCronUrl = `${nextUrl}&cron=1`;
       await Promise.race([
@@ -358,7 +390,6 @@ export default async function handler(req, res) {
       contoh_update: updatedDetails
     };
 
-    // Jika dibuka di browser dengan ?auto=1, tampilkan progres & otomatis lanjut ke halaman berikutnya
     if (isAutoBrowser) {
       res.setHeader('Content-Type', 'text/html; charset=utf-8');
       return res.status(200).send(`
@@ -375,7 +406,7 @@ export default async function handler(req, res) {
           </style>
         </head>
         <body>
-          <h2>Sinkronisasi Harga Trends.nz → Shopify</h2>
+          <h2>Sinkronisasi Harga Trends.nz → Shopify (Qty Terendah + Markup 50%)</h2>
           <p><span class="badge">${isFinished ? 'SELESAI 100%' : `MEMPROSES HALAMAN ${currentPage} DARI ${totalPages}...`}</span></p>
           <pre>${JSON.stringify(summaryPayload, null, 2)}</pre>
         </body>

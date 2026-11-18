@@ -11,14 +11,17 @@ function normalizeShopifyDomain(rawUrl = '') {
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-// Mengambil harga modal dari tier QUANTITY PALING RENDAH
-function getLowestQuantityTier(item) {
+// Mengambil harga modal dari QUANTITY PALING RENDAH + Biaya Branding Utama (additional_costs)
+function calculateLowestQtyCost(item) {
   let tiers = null;
   if (item.pricing && Array.isArray(item.pricing.prices) && item.pricing.prices.length > 0) {
     tiers = item.pricing.prices;
   } else if (Array.isArray(item.prices) && item.prices.length > 0) {
     tiers = item.prices;
   }
+
+  let minQty = null;
+  let blankPrice = NaN;
 
   if (tiers) {
     const validTiers = tiers
@@ -32,7 +35,6 @@ function getLowestQuantityTier(item) {
       .filter((t) => !isNaN(t.price) && t.price > 0);
 
     if (validTiers.length > 0) {
-      // Urutkan dari quantity paling kecil; jika field qty tidak tersedia, ambil harga tertinggi (tier terendah)
       validTiers.sort((a, b) => {
         const aHasQty = !isNaN(a.qty) && a.qty > 0;
         const bHasQty = !isNaN(b.qty) && b.qty > 0;
@@ -42,18 +44,69 @@ function getLowestQuantityTier(item) {
         return b.price - a.price;
       });
 
-      return {
-        qty: !isNaN(validTiers[0].qty) ? validTiers[0].qty : null,
-        basePrice: validTiers[0].price
-      };
+      minQty = !isNaN(validTiers[0].qty) && validTiers[0].qty > 0 ? validTiers[0].qty : 1;
+      blankPrice = validTiers[0].price;
+    }
+  } else if (item.price !== undefined && item.price !== null && parseFloat(item.price) > 0) {
+    minQty = 1;
+    blankPrice = parseFloat(item.price);
+  }
+
+  if (isNaN(blankPrice) || blankPrice <= 0) {
+    return null;
+  }
+
+  // Hitung biaya branding utama (additional_costs) sesuai kalkulator website Trends.nz
+  let brandingPerUnit = 0;
+  const additionalCosts = Array.isArray(item.pricing?.additional_costs)
+    ? item.pricing.additional_costs
+    : [];
+  const primaryDesc = (item.pricing?.primary_price_description || '').trim().toLowerCase();
+
+  if (additionalCosts.length > 0 && primaryDesc && primaryDesc !== '-') {
+    const matchedCost =
+      additionalCosts.find((c) => {
+        const desc = (c.description || '').trim().toLowerCase();
+        const opt = (c.branding_option || '').trim().toLowerCase();
+        return (
+          desc === primaryDesc ||
+          opt === primaryDesc ||
+          primaryDesc.includes(desc) ||
+          (opt && primaryDesc.includes(opt))
+        );
+      }) || additionalCosts[0];
+
+    if (matchedCost) {
+      let unitBranding = parseFloat(matchedCost.unit_price || 0);
+      // Jika additional_costs memiliki tier harga berdasarkan qty
+      if (Array.isArray(matchedCost.prices) && matchedCost.prices.length > 0) {
+        const sortedBrandingTiers = [...matchedCost.prices]
+          .map((p) => ({
+            qty: parseFloat(p.quantity ?? p.qty ?? 1),
+            price: parseFloat(p.price ?? p.unit_price ?? 0)
+          }))
+          .filter((p) => !isNaN(p.price))
+          .sort((a, b) => a.qty - b.qty);
+
+        if (sortedBrandingTiers.length > 0) {
+          unitBranding = sortedBrandingTiers[0].price;
+        }
+      }
+
+      const setupTotal = parseFloat(matchedCost.setup_price ?? matchedCost.setup ?? 0);
+      const setupPerUnit = minQty > 0 ? setupTotal / minQty : 0;
+      brandingPerUnit = (isNaN(unitBranding) ? 0 : unitBranding) + (isNaN(setupPerUnit) ? 0 : setupPerUnit);
     }
   }
 
-  if (item.price !== undefined && item.price !== null && !isNaN(parseFloat(item.price)) && parseFloat(item.price) > 0) {
-    return { qty: 1, basePrice: parseFloat(item.price) };
-  }
+  const totalBaseCost = blankPrice + brandingPerUnit;
 
-  return null;
+  return {
+    qty: minQty,
+    blankPrice,
+    brandingPerUnit: parseFloat(brandingPerUnit.toFixed(4)),
+    totalBaseCost: parseFloat(totalBaseCost.toFixed(4))
+  };
 }
 
 // Helper mengambil 1 halaman Trends.nz
@@ -196,11 +249,40 @@ export default async function handler(req, res) {
       ? TRENDS_TOKEN
       : `Bearer ${TRENDS_TOKEN}`;
 
+    const MARKUP_MULTIPLIER = 1.50; // Markup 50%
+
+    // MODE INSPEKSI 1 SKU: Buka /api/sync?inspect_sku=135414 untuk mengecek detail harga & additional_costs
+    if (req.query.inspect_sku) {
+      const targetSku = req.query.inspect_sku.toString().trim();
+      const singleRes = await fetch(
+        `https://au.api.trends.nz/api/v1/products/${encodeURIComponent(targetSku)}.json`,
+        {
+          headers: {
+            'Authorization': authHeader,
+            'Accept': 'application/json'
+          }
+        }
+      );
+      const singleJson = await singleRes.json();
+      const productObj = singleJson.product || singleJson.data || singleJson;
+      const calc = calculateLowestQtyCost(productObj);
+
+      return res.status(200).json({
+        sku: targetSku,
+        hasil_kalkulasi: calc
+          ? {
+              ...calc,
+              harga_jual_markup_50_persen: (calc.totalBaseCost * MARKUP_MULTIPLIER).toFixed(2)
+            }
+          : null,
+        raw_pricing_trends: productObj.pricing || productObj.prices || productObj
+      });
+    }
+
     const startPage = Math.max(1, parseInt(req.query.page || '1', 10));
     const isAutoBrowser = req.query.auto === '1';
     const isCron = req.query.cron === '1';
     const PAGE_SIZE = 250;
-    const MARKUP_MULTIPLIER = 1.50; // Markup 50% pada quantity paling rendah
 
     let currentPage = startPage;
     let totalPages = startPage;
@@ -241,9 +323,9 @@ export default async function handler(req, res) {
 
       for (const item of items) {
         const sku = (item.code || item.sku || item.item_code || '').toString().trim();
-        const lowestTier = getLowestQuantityTier(item);
+        const costInfo = calculateLowestQtyCost(item);
 
-        if (!sku || !lowestTier) {
+        if (!sku || !costInfo) {
           totalSkippedNoPrice++;
           continue;
         }
@@ -255,9 +337,11 @@ export default async function handler(req, res) {
         validProducts.push({
           sku,
           skuLower,
-          minQty: lowestTier.qty,
-          basePrice: lowestTier.basePrice,
-          newPriceStr: (lowestTier.basePrice * MARKUP_MULTIPLIER).toFixed(2)
+          minQty: costInfo.qty,
+          blankPrice: costInfo.blankPrice,
+          brandingPerUnit: costInfo.brandingPerUnit,
+          totalBaseCost: costInfo.totalBaseCost,
+          newPriceStr: (costInfo.totalBaseCost * MARKUP_MULTIPLIER).toFixed(2)
         });
       }
 
@@ -284,7 +368,9 @@ export default async function handler(req, res) {
               variantId: variant.variantId,
               sku: prod.sku,
               minQty: prod.minQty,
-              basePrice: prod.basePrice,
+              blankPrice: prod.blankPrice,
+              brandingPerUnit: prod.brandingPerUnit,
+              totalBaseCost: prod.totalBaseCost,
               currentShopifyPrice: variant.currentPrice,
               newPriceStr: prod.newPriceStr
             });
@@ -343,7 +429,9 @@ export default async function handler(req, res) {
                   updatedDetails.push({
                     sku: item.sku,
                     qty_terendah: item.minQty,
-                    modal_trends: item.basePrice,
+                    modal_polosan: item.blankPrice,
+                    biaya_branding_per_unit: item.brandingPerUnit,
+                    total_modal: item.totalBaseCost,
                     harga_lama: item.currentShopifyPrice,
                     harga_baru: item.newPriceStr
                   });
@@ -406,7 +494,7 @@ export default async function handler(req, res) {
           </style>
         </head>
         <body>
-          <h2>Sinkronisasi Harga Trends.nz → Shopify (Qty Terendah + Markup 50%)</h2>
+          <h2>Sinkronisasi Harga Trends.nz → Shopify (Qty Terendah + Branding + Markup 50%)</h2>
           <p><span class="badge">${isFinished ? 'SELESAI 100%' : `MEMPROSES HALAMAN ${currentPage} DARI ${totalPages}...`}</span></p>
           <pre>${JSON.stringify(summaryPayload, null, 2)}</pre>
         </body>

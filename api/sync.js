@@ -11,11 +11,21 @@ function normalizeShopifyDomain(rawUrl = '') {
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-// Mengambil harga modal dari QUANTITY PALING RENDAH + Biaya Branding Utama (additional_costs)
-function calculateLowestQtyCost(item) {
+// Pembulatan presisi 2 desimal agar tidak meleset karena floating-point JS
+function roundMoney(num) {
+  return Math.round((num + 1e-9) * 100) / 100;
+}
+
+// Mengambil harga modal dari QUANTITY PALING RENDAH + Branding Utama + Shipping & Handling ($15)
+function calculateLowestQtyCost(item, shippingHandlingFee = 15) {
+  // Unwrap item.pricing jika berbentuk array (endpoint detail) maupun objek (endpoint list)
+  const pricingObj = Array.isArray(item.pricing)
+    ? item.pricing.find((p) => (p.type || '').toLowerCase() === 'stock') || item.pricing[0]
+    : item.pricing;
+
   let tiers = null;
-  if (item.pricing && Array.isArray(item.pricing.prices) && item.pricing.prices.length > 0) {
-    tiers = item.pricing.prices;
+  if (pricingObj && Array.isArray(pricingObj.prices) && pricingObj.prices.length > 0) {
+    tiers = pricingObj.prices;
   } else if (Array.isArray(item.prices) && item.prices.length > 0) {
     tiers = item.prices;
   }
@@ -56,31 +66,21 @@ function calculateLowestQtyCost(item) {
     return null;
   }
 
-  let brandingPerUnit = 0;
-  const additionalCosts = Array.isArray(item.pricing?.additional_costs)
-    ? item.pricing.additional_costs
+  // Ambil biaya branding utama (additional_costs pertama / tipe DO)
+  let brandingUnitCost = 0;
+  let brandingSetupCost = 0;
+  const additionalCosts = Array.isArray(pricingObj?.additional_costs)
+    ? pricingObj.additional_costs
     : [];
-  const primaryDesc = (item.pricing?.primary_price_description || '').trim().toLowerCase();
 
   if (additionalCosts.length > 0) {
-    const matchedCost =
-      (primaryDesc && primaryDesc !== '-'
-        ? additionalCosts.find((c) => {
-            const desc = (c.description || '').trim().toLowerCase();
-            const opt = (c.branding_option || '').trim().toLowerCase();
-            return (
-              desc === primaryDesc ||
-              opt === primaryDesc ||
-              primaryDesc.includes(desc) ||
-              (opt && primaryDesc.includes(opt))
-            );
-          })
-        : null) || additionalCosts[0];
+    const primaryCost =
+      additionalCosts.find((c) => (c.type || '').toUpperCase() === 'DO') || additionalCosts[0];
 
-    if (matchedCost) {
-      let unitBranding = parseFloat(matchedCost.unit_price || 0);
-      if (Array.isArray(matchedCost.prices) && matchedCost.prices.length > 0) {
-        const sortedBrandingTiers = [...matchedCost.prices]
+    if (primaryCost) {
+      let unitPrice = parseFloat(primaryCost.unit_price || 0);
+      if (Array.isArray(primaryCost.prices) && primaryCost.prices.length > 0) {
+        const sortedBrandingTiers = [...primaryCost.prices]
           .map((p) => ({
             qty: parseFloat(p.quantity ?? p.qty ?? 1),
             price: parseFloat(p.price ?? p.unit_price ?? 0)
@@ -89,23 +89,26 @@ function calculateLowestQtyCost(item) {
           .sort((a, b) => a.qty - b.qty);
 
         if (sortedBrandingTiers.length > 0) {
-          unitBranding = sortedBrandingTiers[0].price;
+          unitPrice = sortedBrandingTiers[0].price;
         }
       }
 
-      const setupTotal = parseFloat(matchedCost.setup_price ?? matchedCost.setup ?? 0);
-      const setupPerUnit = minQty > 0 ? setupTotal / minQty : 0;
-      brandingPerUnit = (isNaN(unitBranding) ? 0 : unitBranding) + (isNaN(setupPerUnit) ? 0 : setupPerUnit);
+      brandingUnitCost = isNaN(unitPrice) ? 0 : unitPrice;
+      const rawSetup = parseFloat(primaryCost.setup_price ?? primaryCost.setup ?? 0);
+      brandingSetupCost = isNaN(rawSetup) ? 0 : rawSetup;
     }
   }
 
-  const totalBaseCost = blankPrice + brandingPerUnit;
+  const setupAndShippingPerUnit = minQty > 0 ? (brandingSetupCost + shippingHandlingFee) / minQty : 0;
+  const totalBaseCost = blankPrice + brandingUnitCost + setupAndShippingPerUnit;
 
   return {
     qty: minQty,
     blankPrice,
-    brandingPerUnit: parseFloat(brandingPerUnit.toFixed(4)),
-    totalBaseCost: parseFloat(totalBaseCost.toFixed(4))
+    brandingUnitCost,
+    brandingSetupCost,
+    shippingHandlingFee,
+    totalBaseCost: roundMoney(totalBaseCost)
   };
 }
 
@@ -237,6 +240,7 @@ export default async function handler(req, res) {
     const TRENDS_TOKEN = process.env.TRENDS_API_TOKEN;
     const SHOPIFY_STORE = normalizeShopifyDomain(process.env.SHOPIFY_STORE_URL);
     const SHOPIFY_TOKEN = process.env.SHOPIFY_ADMIN_TOKEN;
+    const SHIPPING_FEE = parseFloat(process.env.TRENDS_SHIPPING_FEE || '15');
 
     if (!TRENDS_TOKEN || !SHOPIFY_STORE || !SHOPIFY_TOKEN) {
       return res.status(400).json({
@@ -251,7 +255,7 @@ export default async function handler(req, res) {
 
     const MARKUP_MULTIPLIER = 1.50; // Markup 50%
 
-    // MODE INSPEKSI 1 SKU: Unwrap array & tampilkan khusus objek pricing saja
+    // MODE INSPEKSI 1 SKU: Buka /api/sync?inspect_sku=135414 untuk verifikasi kalkulasi
     if (req.query.inspect_sku) {
       const targetSku = req.query.inspect_sku.toString().trim();
       const singleRes = await fetch(
@@ -266,7 +270,7 @@ export default async function handler(req, res) {
       const singleJson = await singleRes.json();
       const rawData = singleJson.product || singleJson.data || singleJson;
       const productObj = Array.isArray(rawData) ? rawData[0] : rawData;
-      const calc = productObj ? calculateLowestQtyCost(productObj) : null;
+      const calc = productObj ? calculateLowestQtyCost(productObj, SHIPPING_FEE) : null;
 
       return res.status(200).json({
         sku: targetSku,
@@ -274,7 +278,7 @@ export default async function handler(req, res) {
         hasil_kalkulasi: calc
           ? {
               ...calc,
-              harga_jual_markup_50_persen: (calc.totalBaseCost * MARKUP_MULTIPLIER).toFixed(2)
+              harga_jual_markup_50_persen: roundMoney(calc.totalBaseCost * MARKUP_MULTIPLIER).toFixed(2)
             }
           : null,
         pricing_asli_trends: productObj?.pricing || productObj?.prices || null
@@ -325,7 +329,7 @@ export default async function handler(req, res) {
 
       for (const item of items) {
         const sku = (item.code || item.sku || item.item_code || '').toString().trim();
-        const costInfo = calculateLowestQtyCost(item);
+        const costInfo = calculateLowestQtyCost(item, SHIPPING_FEE);
 
         if (!sku || !costInfo) {
           totalSkippedNoPrice++;
@@ -336,14 +340,17 @@ export default async function handler(req, res) {
         if (uniqueSkus.has(skuLower)) continue;
         uniqueSkus.add(skuLower);
 
+        const finalPriceStr = roundMoney(costInfo.totalBaseCost * MARKUP_MULTIPLIER).toFixed(2);
+
         validProducts.push({
           sku,
           skuLower,
           minQty: costInfo.qty,
           blankPrice: costInfo.blankPrice,
-          brandingPerUnit: costInfo.brandingPerUnit,
+          brandingUnitCost: costInfo.brandingUnitCost,
+          brandingSetupCost: costInfo.brandingSetupCost,
           totalBaseCost: costInfo.totalBaseCost,
-          newPriceStr: (costInfo.totalBaseCost * MARKUP_MULTIPLIER).toFixed(2)
+          newPriceStr: finalPriceStr
         });
       }
 
@@ -371,7 +378,8 @@ export default async function handler(req, res) {
               sku: prod.sku,
               minQty: prod.minQty,
               blankPrice: prod.blankPrice,
-              brandingPerUnit: prod.brandingPerUnit,
+              brandingUnitCost: prod.brandingUnitCost,
+              brandingSetupCost: prod.brandingSetupCost,
               totalBaseCost: prod.totalBaseCost,
               currentShopifyPrice: variant.currentPrice,
               newPriceStr: prod.newPriceStr
@@ -432,8 +440,9 @@ export default async function handler(req, res) {
                     sku: item.sku,
                     qty_terendah: item.minQty,
                     modal_polosan: item.blankPrice,
-                    biaya_branding_per_unit: item.brandingPerUnit,
-                    total_modal: item.totalBaseCost,
+                    biaya_branding_unit: item.brandingUnitCost,
+                    biaya_setup: item.brandingSetupCost,
+                    total_modal_per_unit: item.totalBaseCost,
                     harga_lama: item.currentShopifyPrice,
                     harga_baru: item.newPriceStr
                   });
@@ -496,7 +505,7 @@ export default async function handler(req, res) {
           </style>
         </head>
         <body>
-          <h2>Sinkronisasi Harga Trends.nz → Shopify (Qty Terendah + Branding + Markup 50%)</h2>
+          <h2>Sinkronisasi Harga Trends.nz → Shopify (Qty Terendah + Branding + Shipping + Markup 50%)</h2>
           <p><span class="badge">${isFinished ? 'SELESAI 100%' : `MEMPROSES HALAMAN ${currentPage} DARI ${totalPages}...`}</span></p>
           <pre>${JSON.stringify(summaryPayload, null, 2)}</pre>
         </body>

@@ -56,29 +56,29 @@ function calculateLowestQtyCost(item) {
     return null;
   }
 
-  // Hitung biaya branding utama (additional_costs) sesuai kalkulator website Trends.nz
   let brandingPerUnit = 0;
   const additionalCosts = Array.isArray(item.pricing?.additional_costs)
     ? item.pricing.additional_costs
     : [];
   const primaryDesc = (item.pricing?.primary_price_description || '').trim().toLowerCase();
 
-  if (additionalCosts.length > 0 && primaryDesc && primaryDesc !== '-') {
+  if (additionalCosts.length > 0) {
     const matchedCost =
-      additionalCosts.find((c) => {
-        const desc = (c.description || '').trim().toLowerCase();
-        const opt = (c.branding_option || '').trim().toLowerCase();
-        return (
-          desc === primaryDesc ||
-          opt === primaryDesc ||
-          primaryDesc.includes(desc) ||
-          (opt && primaryDesc.includes(opt))
-        );
-      }) || additionalCosts[0];
+      (primaryDesc && primaryDesc !== '-'
+        ? additionalCosts.find((c) => {
+            const desc = (c.description || '').trim().toLowerCase();
+            const opt = (c.branding_option || '').trim().toLowerCase();
+            return (
+              desc === primaryDesc ||
+              opt === primaryDesc ||
+              primaryDesc.includes(desc) ||
+              (opt && primaryDesc.includes(opt))
+            );
+          })
+        : null) || additionalCosts[0];
 
     if (matchedCost) {
       let unitBranding = parseFloat(matchedCost.unit_price || 0);
-      // Jika additional_costs memiliki tier harga berdasarkan qty
       if (Array.isArray(matchedCost.prices) && matchedCost.prices.length > 0) {
         const sortedBrandingTiers = [...matchedCost.prices]
           .map((p) => ({
@@ -251,7 +251,7 @@ export default async function handler(req, res) {
 
     const MARKUP_MULTIPLIER = 1.50; // Markup 50%
 
-    // MODE INSPEKSI 1 SKU: Buka /api/sync?inspect_sku=135414 untuk mengecek detail harga & additional_costs
+    // MODE INSPEKSI 1 SKU: Unwrap array & tampilkan khusus objek pricing saja
     if (req.query.inspect_sku) {
       const targetSku = req.query.inspect_sku.toString().trim();
       const singleRes = await fetch(
@@ -264,18 +264,20 @@ export default async function handler(req, res) {
         }
       );
       const singleJson = await singleRes.json();
-      const productObj = singleJson.product || singleJson.data || singleJson;
-      const calc = calculateLowestQtyCost(productObj);
+      const rawData = singleJson.product || singleJson.data || singleJson;
+      const productObj = Array.isArray(rawData) ? rawData[0] : rawData;
+      const calc = productObj ? calculateLowestQtyCost(productObj) : null;
 
       return res.status(200).json({
         sku: targetSku,
+        nama_produk: productObj?.name || null,
         hasil_kalkulasi: calc
           ? {
               ...calc,
               harga_jual_markup_50_persen: (calc.totalBaseCost * MARKUP_MULTIPLIER).toFixed(2)
             }
           : null,
-        raw_pricing_trends: productObj.pricing || productObj.prices || productObj
+        pricing_asli_trends: productObj?.pricing || productObj?.prices || null
       });
     }
 

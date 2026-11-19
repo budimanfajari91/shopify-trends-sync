@@ -11,14 +11,12 @@ function normalizeShopifyDomain(rawUrl = '') {
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-// Pembulatan presisi 2 desimal agar tidak meleset karena floating-point JS
 function roundMoney(num) {
   return Math.round((num + 1e-9) * 100) / 100;
 }
 
 // Mengambil harga modal dari QUANTITY PALING RENDAH + Branding Utama + Shipping & Handling ($15)
 function calculateLowestQtyCost(item, shippingHandlingFee = 15) {
-  // Unwrap item.pricing jika berbentuk array (endpoint detail) maupun objek (endpoint list)
   const pricingObj = Array.isArray(item.pricing)
     ? item.pricing.find((p) => (p.type || '').toLowerCase() === 'stock') || item.pricing[0]
     : item.pricing;
@@ -66,7 +64,6 @@ function calculateLowestQtyCost(item, shippingHandlingFee = 15) {
     return null;
   }
 
-  // Ambil biaya branding utama (additional_costs pertama / tipe DO)
   let brandingUnitCost = 0;
   let brandingSetupCost = 0;
   const additionalCosts = Array.isArray(pricingObj?.additional_costs)
@@ -157,77 +154,83 @@ async function fetchTrendsPage(pageNum, pageSize, authHeader, cachedParam = null
   throw new Error(`Parameter paginasi Trends.nz untuk halaman ${pageNum} tidak dikenali.`);
 }
 
-// Helper mencari SKU di Shopify secara batch (50 SKU per query GraphQL)
+// Pencarian SKU di Shopify dengan CHUNK_SIZE = 8 agar tidak terpotong batas operator OR Shopify
 async function lookupShopifyVariantsBatch(skus, storeDomain, token) {
   const skuMap = new Map();
   if (skus.length === 0) return skuMap;
 
-  const CHUNK_SIZE = 50;
+  const CHUNK_SIZE = 8;
   const chunks = [];
   for (let i = 0; i < skus.length; i += CHUNK_SIZE) {
     chunks.push(skus.slice(i, i + CHUNK_SIZE));
   }
 
-  await Promise.all(
-    chunks.map(async (chunk) => {
-      const orQuery = chunk
-        .map((s) => `sku:"${s.replace(/["\\]/g, '')}"`)
-        .join(' OR ');
+  // Jalankan maksimal 6 chunk paralel per gelombang agar kuota GraphQL Shopify tetap aman
+  const CONCURRENCY = 6;
+  for (let i = 0; i < chunks.length; i += CONCURRENCY) {
+    const wave = chunks.slice(i, i + CONCURRENCY);
 
-      const graphqlQuery = {
-        query: `
-          query findVariantsBatch($query: String!) {
-            productVariants(first: 250, query: $query) {
-              edges {
-                node {
-                  id
-                  sku
-                  price
-                  product { id }
+    await Promise.all(
+      wave.map(async (chunk) => {
+        const orQuery = chunk
+          .map((s) => `sku:"${s.replace(/["\\]/g, '')}"`)
+          .join(' OR ');
+
+        const graphqlQuery = {
+          query: `
+            query findVariantsBatch($query: String!) {
+              productVariants(first: 40, query: $query) {
+                edges {
+                  node {
+                    id
+                    sku
+                    price
+                    product { id }
+                  }
                 }
               }
             }
-          }
-        `,
-        variables: { query: orQuery }
-      };
+          `,
+          variables: { query: orQuery }
+        };
 
-      const res = await fetch(`https://${storeDomain}/admin/api/2026-01/graphql.json`, {
-        method: 'POST',
-        headers: {
-          'X-Shopify-Access-Token': token,
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify(graphqlQuery)
-      });
-
-      if (!res.ok) {
-        const txt = await res.text();
-        throw new Error(`Shopify Search HTTP ${res.status}: ${txt.slice(0, 150)}`);
-      }
-
-      const json = await res.json();
-      if (json.errors && json.errors.length > 0) {
-        throw new Error(`Shopify GraphQL Error: ${json.errors[0].message}`);
-      }
-
-      const edges = json.data?.productVariants?.edges || [];
-      for (const edge of edges) {
-        const node = edge.node;
-        const cleanSku = (node.sku || '').trim().toLowerCase();
-        if (!cleanSku) continue;
-
-        if (!skuMap.has(cleanSku)) {
-          skuMap.set(cleanSku, []);
-        }
-        skuMap.get(cleanSku).push({
-          variantId: node.id,
-          productId: node.product?.id,
-          currentPrice: parseFloat(node.price).toFixed(2)
+        const res = await fetch(`https://${storeDomain}/admin/api/2026-01/graphql.json`, {
+          method: 'POST',
+          headers: {
+            'X-Shopify-Access-Token': token,
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify(graphqlQuery)
         });
-      }
-    })
-  );
+
+        if (!res.ok) {
+          const txt = await res.text();
+          throw new Error(`Shopify Search HTTP ${res.status}: ${txt.slice(0, 150)}`);
+        }
+
+        const json = await res.json();
+        if (json.errors && json.errors.length > 0) {
+          throw new Error(`Shopify GraphQL Error: ${json.errors[0].message}`);
+        }
+
+        const edges = json.data?.productVariants?.edges || [];
+        for (const edge of edges) {
+          const node = edge.node;
+          const cleanSku = (node.sku || '').trim().toLowerCase();
+          if (!cleanSku) continue;
+
+          if (!skuMap.has(cleanSku)) {
+            skuMap.set(cleanSku, []);
+          }
+          skuMap.get(cleanSku).push({
+            variantId: node.id,
+            productId: node.product?.id,
+            currentPrice: parseFloat(node.price).toFixed(2)
+          });
+        }
+      })
+    );
+  }
 
   return skuMap;
 }
@@ -255,7 +258,45 @@ export default async function handler(req, res) {
 
     const MARKUP_MULTIPLIER = 1.50; // Markup 50%
 
-    // MODE INSPEKSI 1 SKU: Buka /api/sync?inspect_sku=135414 untuk verifikasi kalkulasi
+    // MODE CEK SAMPEL SHOPIFY: Buka /api/sync?sample_shopify=1 untuk melihat 50 SKU yang tersimpan di Shopify
+    if (req.query.sample_shopify === '1') {
+      const sampleRes = await fetch(`https://${SHOPIFY_STORE}/admin/api/2026-01/graphql.json`, {
+        method: 'POST',
+        headers: {
+          'X-Shopify-Access-Token': SHOPIFY_TOKEN,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          query: `
+            query {
+              productVariants(first: 50) {
+                edges {
+                  node {
+                    sku
+                    price
+                    product { title status }
+                  }
+                }
+              }
+            }
+          `
+        })
+      });
+      const sampleJson = await sampleRes.json();
+      const list = (sampleJson.data?.productVariants?.edges || []).map((e) => ({
+        sku: e.node.sku,
+        harga_shopify: e.node.price,
+        status_produk: e.node.product?.status,
+        nama_produk: e.node.product?.title
+      }));
+
+      return res.status(200).json({
+        total_sampel: list.length,
+        daftar_sku_shopify: list
+      });
+    }
+
+    // MODE INSPEKSI 1 SKU
     if (req.query.inspect_sku) {
       const targetSku = req.query.inspect_sku.toString().trim();
       const singleRes = await fetch(
@@ -288,7 +329,7 @@ export default async function handler(req, res) {
     const startPage = Math.max(1, parseInt(req.query.page || '1', 10));
     const isAutoBrowser = req.query.auto === '1';
     const isCron = req.query.cron === '1';
-    const PAGE_SIZE = 250;
+    const PAGE_SIZE = 150; // 150 produk per halaman agar 19 chunk pencarian selesai sangat cepat
 
     let currentPage = startPage;
     let totalPages = startPage;
@@ -505,7 +546,7 @@ export default async function handler(req, res) {
           </style>
         </head>
         <body>
-          <h2>Sinkronisasi Harga Trends.nz → Shopify (Qty Terendah + Branding + Shipping + Markup 50%)</h2>
+          <h2>Sinkronisasi Harga Trends.nz → Shopify (Full SKU Match)</h2>
           <p><span class="badge">${isFinished ? 'SELESAI 100%' : `MEMPROSES HALAMAN ${currentPage} DARI ${totalPages}...`}</span></p>
           <pre>${JSON.stringify(summaryPayload, null, 2)}</pre>
         </body>

@@ -158,7 +158,7 @@ async function fetchTrendsPage(pageNum, pageSize, authHeader, cachedParam = null
   throw new Error(`Parameter paginasi Trends.nz untuk halaman ${pageNum} tidak dikenali.`);
 }
 
-// Helper khusus mode ?report=1: Tarik seluruh katalog Trends.nz secara paralel
+// Tarik seluruh katalog Trends.nz untuk mode ?report=1
 async function fetchAllTrendsCatalogForReport(authHeader) {
   const first = await fetchTrendsPage(1, 250, authHeader, null);
   const allItems = [...first.items];
@@ -186,13 +186,22 @@ async function fetchAllTrendsCatalogForReport(authHeader) {
   return { items: allItems, totalCatalog: first.totalItems || allItems.length };
 }
 
-// Helper khusus mode ?report=1: Tarik seluruh varian Shopify ke Map (250 varian/request)
-async function fetchAllShopifyVariantsMap(storeDomain, token) {
-  const skuMap = new Map();
+// Bangun 4 lapisan index (Exact SKU, Prefix SKU, Barcode/Handle, Exact Title) dari seluruh varian Shopify
+async function fetchAllShopifyVariantsMultiMap(storeDomain, token) {
+  const exactSkuMap = new Map();
+  const prefixSkuMap = new Map();
+  const barcodeHandleMap = new Map();
   const titleMap = new Map();
+
   let hasNextPage = true;
   let cursor = null;
   let totalVariantsScanned = 0;
+
+  const pushToMap = (map, key, val) => {
+    if (!key) return;
+    if (!map.has(key)) map.set(key, []);
+    map.get(key).push(val);
+  };
 
   while (hasNextPage) {
     const res = await fetch(`https://${storeDomain}/admin/api/2026-01/graphql.json`, {
@@ -203,15 +212,20 @@ async function fetchAllShopifyVariantsMap(storeDomain, token) {
       },
       body: JSON.stringify({
         query: `
-          query getAllVariantsReport($cursor: String) {
+          query getAllVariantsMulti($cursor: String) {
             productVariants(first: 250, after: $cursor) {
               pageInfo { hasNextPage endCursor }
               edges {
                 node {
                   id
                   sku
+                  barcode
                   price
-                  product { id title }
+                  product {
+                    id
+                    title
+                    handle
+                  }
                 }
               }
             }
@@ -221,7 +235,7 @@ async function fetchAllShopifyVariantsMap(storeDomain, token) {
       })
     });
 
-    if (!res.ok) throw new Error(`Shopify Report HTTP ${res.status}`);
+    if (!res.ok) throw new Error(`Shopify GraphQL HTTP ${res.status}`);
     const json = await res.json();
     if (json.errors?.length) throw new Error(json.errors[0].message);
 
@@ -232,21 +246,43 @@ async function fetchAllShopifyVariantsMap(storeDomain, token) {
       totalVariantsScanned++;
       const node = edge.node;
       const cleanSku = (node.sku || '').trim();
+      const cleanBarcode = (node.barcode || '').trim();
+      const handle = (node.product?.handle || '').trim().toLowerCase();
+      const title = (node.product?.title || '').trim();
+
       const entry = {
         variantId: node.id,
         productId: node.product?.id,
+        shopifySku: cleanSku || null,
         currentPrice: parseFloat(node.price).toFixed(2)
       };
 
       if (cleanSku) {
-        const key = cleanSku.toLowerCase();
-        if (!skuMap.has(key)) skuMap.set(key, []);
-        skuMap.get(key).push(entry);
-      } else if (node.product?.title) {
-        const tKey = normalizeTitle(node.product.title);
-        if (tKey) {
-          if (!titleMap.has(tKey)) titleMap.set(tKey, []);
-          titleMap.get(tKey).push(entry);
+        const skuLower = cleanSku.toLowerCase();
+        // Lapisan 1: Exact SKU
+        pushToMap(exactSkuMap, skuLower, entry);
+
+        // Lapisan 2: Prefix SKU (misal "100144-blk" -> kode induk "100144")
+        const baseMatch = skuLower.match(/^([a-z0-9]+)[-_/\s]+.+$/);
+        if (baseMatch && baseMatch[1]) {
+          pushToMap(prefixSkuMap, baseMatch[1], entry);
+        }
+      } else {
+        // Lapisan 3: Barcode atau Handle jika kolom SKU kosong (null)
+        if (cleanBarcode) {
+          pushToMap(barcodeHandleMap, cleanBarcode.toLowerCase(), entry);
+        }
+        if (handle) {
+          const tokens = handle.split('-');
+          for (const tok of tokens) {
+            if (/^\d{4,}$/.test(tok)) {
+              pushToMap(barcodeHandleMap, tok, entry);
+            }
+          }
+        }
+        // Lapisan 4: Nama produk persis jika kolom SKU kosong (null)
+        if (title) {
+          pushToMap(titleMap, normalizeTitle(title), entry);
         }
       }
     }
@@ -260,48 +296,52 @@ async function fetchAllShopifyVariantsMap(storeDomain, token) {
     }
   }
 
-  return { skuMap, titleMap, totalVariantsScanned };
+  return {
+    exactSkuMap,
+    prefixSkuMap,
+    barcodeHandleMap,
+    titleMap,
+    totalVariantsScanned
+  };
 }
 
-// Pencarian varian Shopify berdasarkan SKU (CHUNK_SIZE = 8) & opsional fallback Nama Produk
-async function lookupShopifyVariantsBatch(products, storeDomain, token, enableTitleFallback = false) {
-  const skuMap = new Map();
+// Pencari 4 lapisan untuk mode sinkronisasi halaman demi halaman (?auto=1)
+async function lookupShopifyVariants4Layers(products, storeDomain, token) {
+  const exactSkuMap = new Map();
+  const prefixSkuMap = new Map();
+  const barcodeHandleMap = new Map();
   const titleMap = new Map();
-  if (products.length === 0) return { skuMap, titleMap };
 
-  const CHUNK_SIZE = 8;
+  if (products.length === 0) {
+    return { exactSkuMap, prefixSkuMap, barcodeHandleMap, titleMap };
+  }
+
+  const pushUnique = (map, key, entry) => {
+    if (!key) return;
+    if (!map.has(key)) map.set(key, []);
+    const arr = map.get(key);
+    if (!arr.some((x) => x.variantId === entry.variantId)) {
+      arr.push(entry);
+    }
+  };
+
+  // Query Lapisan 1, 2, dan 3: sku:100144* OR barcode:100144
+  const CHUNK_SIZE = 6;
   const chunks = [];
   for (let i = 0; i < products.length; i += CHUNK_SIZE) {
     chunks.push(products.slice(i, i + CHUNK_SIZE));
   }
 
-  const CONCURRENCY = 6;
-  for (let i = 0; i < chunks.length; i += CONCURRENCY) {
-    const wave = chunks.slice(i, i + CONCURRENCY);
-
+  for (let i = 0; i < chunks.length; i += 6) {
+    const wave = chunks.slice(i, i + 6);
     await Promise.all(
       wave.map(async (chunk) => {
-        const orQuery = chunk
-          .map((p) => `sku:"${p.sku.replace(/["\\]/g, '')}"`)
+        const queryStr = chunk
+          .map((p) => {
+            const safe = p.sku.replace(/["\\*]/g, '');
+            return `sku:${safe}* OR barcode:"${safe}"`;
+          })
           .join(' OR ');
-
-        const graphqlQuery = {
-          query: `
-            query findVariantsBatch($query: String!) {
-              productVariants(first: 40, query: $query) {
-                edges {
-                  node {
-                    id
-                    sku
-                    price
-                    product { id }
-                  }
-                }
-              }
-            }
-          `,
-          variables: { query: orQuery }
-        };
 
         const res = await fetch(`https://${storeDomain}/admin/api/2026-01/graphql.json`, {
           method: 'POST',
@@ -309,117 +349,155 @@ async function lookupShopifyVariantsBatch(products, storeDomain, token, enableTi
             'X-Shopify-Access-Token': token,
             'Content-Type': 'application/json'
           },
-          body: JSON.stringify(graphqlQuery)
+          body: JSON.stringify({
+            query: `
+              query findVariants4L($query: String!) {
+                productVariants(first: 60, query: $query) {
+                  edges {
+                    node {
+                      id
+                      sku
+                      barcode
+                      price
+                      product { id title handle }
+                    }
+                  }
+                }
+              }
+            `,
+            variables: { query: queryStr }
+          })
         });
 
-        if (!res.ok) {
-          const txt = await res.text();
-          throw new Error(`Shopify Search HTTP ${res.status}: ${txt.slice(0, 150)}`);
-        }
-
+        if (!res.ok) return;
         const json = await res.json();
-        if (json.errors && json.errors.length > 0) {
-          throw new Error(`Shopify GraphQL Error: ${json.errors[0].message}`);
-        }
-
         const edges = json.data?.productVariants?.edges || [];
+
         for (const edge of edges) {
           const node = edge.node;
-          const cleanSku = (node.sku || '').trim().toLowerCase();
-          if (!cleanSku) continue;
-
-          if (!skuMap.has(cleanSku)) {
-            skuMap.set(cleanSku, []);
-          }
-          skuMap.get(cleanSku).push({
+          const cleanSku = (node.sku || '').trim();
+          const cleanBarcode = (node.barcode || '').trim();
+          const entry = {
             variantId: node.id,
             productId: node.product?.id,
+            shopifySku: cleanSku || null,
             currentPrice: parseFloat(node.price).toFixed(2)
-          });
+          };
+
+          if (cleanSku) {
+            const skuLower = cleanSku.toLowerCase();
+            pushUnique(exactSkuMap, skuLower, entry);
+            const baseMatch = skuLower.match(/^([a-z0-9]+)[-_/\s]+.+$/);
+            if (baseMatch && baseMatch[1]) {
+              pushUnique(prefixSkuMap, baseMatch[1], entry);
+            }
+          } else if (cleanBarcode) {
+            pushUnique(barcodeHandleMap, cleanBarcode.toLowerCase(), entry);
+          }
         }
       })
     );
   }
 
-  if (enableTitleFallback) {
-    const unmatchedWithTitle = products.filter(
-      (p) => !skuMap.has(p.skuLower) && p.cleanTitle.length >= 6
-    );
+  // Query Lapisan 4: Cari berdasarkan Nama Produk untuk yang belum ketemu via SKU/Barcode
+  const unmatched = products.filter(
+    (p) =>
+      !exactSkuMap.has(p.skuLower) &&
+      !prefixSkuMap.has(p.skuLower) &&
+      !barcodeHandleMap.has(p.skuLower) &&
+      p.cleanTitle.length >= 5
+  );
 
-    const titleChunks = [];
-    for (let i = 0; i < unmatchedWithTitle.length; i += 6) {
-      titleChunks.push(unmatchedWithTitle.slice(i, i + 6));
-    }
+  const titleChunks = [];
+  for (let i = 0; i < unmatched.length; i += 6) {
+    titleChunks.push(unmatched.slice(i, i + 6));
+  }
 
-    for (let i = 0; i < titleChunks.length; i += 5) {
-      const wave = titleChunks.slice(i, i + 5);
-      await Promise.all(
-        wave.map(async (chunk) => {
-          const titleQuery = chunk
-            .map((p) => `title:"${p.rawName.replace(/["\\]/g, '')}"`)
-            .join(' OR ');
+  for (let i = 0; i < titleChunks.length; i += 6) {
+    const wave = titleChunks.slice(i, i + 6);
+    await Promise.all(
+      wave.map(async (chunk) => {
+        const titleQuery = chunk
+          .map((p) => `title:"${p.rawName.replace(/["\\]/g, '')}"`)
+          .join(' OR ');
 
-          const res = await fetch(`https://${storeDomain}/admin/api/2026-01/graphql.json`, {
-            method: 'POST',
-            headers: {
-              'X-Shopify-Access-Token': token,
-              'Content-Type': 'application/json'
-            },
-            body: JSON.stringify({
-              query: `
-                query findProductsByTitle($query: String!) {
-                  products(first: 20, query: $query) {
-                    edges {
-                      node {
-                        id
-                        title
-                        variants(first: 20) {
-                          edges {
-                            node {
-                              id
-                              sku
-                              price
-                            }
+        const res = await fetch(`https://${storeDomain}/admin/api/2026-01/graphql.json`, {
+          method: 'POST',
+          headers: {
+            'X-Shopify-Access-Token': token,
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({
+            query: `
+              query findByTitle4L($query: String!) {
+                products(first: 25, query: $query) {
+                  edges {
+                    node {
+                      id
+                      title
+                      handle
+                      variants(first: 30) {
+                        edges {
+                          node {
+                            id
+                            sku
+                            price
                           }
                         }
                       }
                     }
                   }
                 }
-              `,
-              variables: { query: titleQuery }
-            })
-          });
-
-          if (!res.ok) return;
-          const json = await res.json();
-          const pEdges = json.data?.products?.edges || [];
-
-          for (const pEdge of pEdges) {
-            const pNode = pEdge.node;
-            const normTitle = normalizeTitle(pNode.title);
-            const vEdges = pNode.variants?.edges || [];
-
-            for (const vEdge of vEdges) {
-              const vNode = vEdge.node;
-              if (!vNode.sku || vNode.sku.trim() === '') {
-                if (!titleMap.has(normTitle)) {
-                  titleMap.set(normTitle, []);
-                }
-                titleMap.get(normTitle).push({
-                  variantId: vNode.id,
-                  productId: pNode.id,
-                  currentPrice: parseFloat(vNode.price).toFixed(2)
-                });
               }
+            `,
+            variables: { query: titleQuery }
+          })
+        });
+
+        if (!res.ok) return;
+        const json = await res.json();
+        const pEdges = json.data?.products?.edges || [];
+
+        for (const pEdge of pEdges) {
+          const pNode = pEdge.node;
+          const normTitle = normalizeTitle(pNode.title);
+          const vEdges = pNode.variants?.edges || [];
+
+          for (const vEdge of vEdges) {
+            const vNode = vEdge.node;
+            if (!vNode.sku || vNode.sku.trim() === '') {
+              pushUnique(titleMap, normTitle, {
+                variantId: vNode.id,
+                productId: pNode.id,
+                shopifySku: null,
+                currentPrice: parseFloat(vNode.price).toFixed(2)
+              });
             }
           }
-        })
-      );
-    }
+        }
+      })
+    );
   }
 
-  return { skuMap, titleMap };
+  return { exactSkuMap, prefixSkuMap, barcodeHandleMap, titleMap };
+}
+
+function resolveProductMatches(prod, maps) {
+  const { exactSkuMap, prefixSkuMap, barcodeHandleMap, titleMap } = maps;
+
+  if (exactSkuMap.has(prod.skuLower)) {
+    return { matches: exactSkuMap.get(prod.skuLower), layer: '1_exact_sku' };
+  }
+  if (prefixSkuMap.has(prod.skuLower)) {
+    return { matches: prefixSkuMap.get(prod.skuLower), layer: '2_prefix_variant_sku' };
+  }
+  if (barcodeHandleMap.has(prod.skuLower)) {
+    return { matches: barcodeHandleMap.get(prod.skuLower), layer: '3_barcode_atau_handle' };
+  }
+  if (prod.cleanTitle && titleMap.has(prod.cleanTitle)) {
+    return { matches: titleMap.get(prod.cleanTitle), layer: '4_nama_produk_persis' };
+  }
+  return { matches: [], layer: null };
 }
 
 export default async function handler(req, res) {
@@ -444,21 +522,73 @@ export default async function handler(req, res) {
       : `Bearer ${TRENDS_TOKEN}`;
 
     const MARKUP_MULTIPLIER = 1.50;
-    const enableTitleFallback = req.query.match_title === '1';
 
-    // MODE RANGKUMAN INSTAN: Buka /api/sync?report=1 untuk melihat rekap seluruh 2.794+ produk sekaligus
+    // MODE DIAGNOSA 1 PRODUK DI SHOPIFY: Buka /api/sync?check_shopify=100144
+    if (req.query.check_shopify) {
+      const keyword = req.query.check_shopify.toString().trim();
+      const checkRes = await fetch(`https://${SHOPIFY_STORE}/admin/api/2026-01/graphql.json`, {
+        method: 'POST',
+        headers: {
+          'X-Shopify-Access-Token': SHOPIFY_TOKEN,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          query: `
+            query checkProduct($q: String!) {
+              products(first: 5, query: $q) {
+                edges {
+                  node {
+                    id
+                    title
+                    handle
+                    status
+                    tags
+                    variants(first: 20) {
+                      edges {
+                        node {
+                          id
+                          title
+                          sku
+                          barcode
+                          price
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          `,
+          variables: { q: keyword }
+        })
+      });
+      const checkJson = await checkRes.json();
+      return res.status(200).json({
+        kata_kunci: keyword,
+        hasil_di_shopify: (checkJson.data?.products?.edges || []).map((e) => e.node)
+      });
+    }
+
+    // MODE RANGKUMAN INSTAN 4 LAPISAN: Buka /api/sync?report=1
     if (req.query.report === '1') {
-      const [{ items: allTrendsItems, totalCatalog }, { skuMap, titleMap, totalVariantsScanned }] =
-        await Promise.all([
-          fetchAllTrendsCatalogForReport(authHeader),
-          fetchAllShopifyVariantsMap(SHOPIFY_STORE, SHOPIFY_TOKEN)
-        ]);
+      const [{ items: allTrendsItems, totalCatalog }, maps] = await Promise.all([
+        fetchAllTrendsCatalogForReport(authHeader),
+        fetchAllShopifyVariantsMultiMap(SHOPIFY_STORE, SHOPIFY_TOKEN)
+      ]);
 
       const seenSkus = new Set();
       let variantsAlreadyMatch = 0;
       let variantsNeedUpdate = 0;
       let skippedNoPrice = 0;
       let notFoundInShopify = 0;
+
+      const matchBreakdown = {
+        '1_exact_sku': 0,
+        '2_prefix_variant_sku': 0,
+        '3_barcode_atau_handle': 0,
+        '4_nama_produk_persis': 0
+      };
+
       const sampleNeedUpdate = [];
       const sampleNotFound = [];
 
@@ -475,20 +605,27 @@ export default async function handler(req, res) {
         if (seenSkus.has(skuLower)) continue;
         seenSkus.add(skuLower);
 
+        const rawName = (item.name || '').toString().trim();
         const targetPriceStr = roundMoney(costInfo.totalBaseCost * MARKUP_MULTIPLIER).toFixed(2);
-        let matches = skuMap.get(skuLower);
 
-        if ((!matches || matches.length === 0) && enableTitleFallback) {
-          matches = titleMap.get(normalizeTitle(item.name || ''));
-        }
+        const prodObj = {
+          sku,
+          skuLower,
+          rawName,
+          cleanTitle: normalizeTitle(rawName)
+        };
+
+        const { matches, layer } = resolveProductMatches(prodObj, maps);
 
         if (!matches || matches.length === 0) {
           notFoundInShopify++;
           if (sampleNotFound.length < 25) {
-            sampleNotFound.push({ sku, nama_trends: item.name || '-' });
+            sampleNotFound.push({ sku, nama_trends: rawName || '-' });
           }
           continue;
         }
+
+        if (layer) matchBreakdown[layer] += matches.length;
 
         for (const variant of matches) {
           if (variant.currentPrice === targetPriceStr) {
@@ -497,7 +634,9 @@ export default async function handler(req, res) {
             variantsNeedUpdate++;
             if (sampleNeedUpdate.length < 25) {
               sampleNeedUpdate.push({
-                sku,
+                sku_trends: sku,
+                sku_shopify: variant.shopifySku,
+                cocok_via: layer,
                 harga_shopify_sekarang: variant.currentPrice,
                 harga_seharusnya: targetPriceStr
               });
@@ -508,17 +647,18 @@ export default async function handler(req, res) {
 
       return res.status(200).json({
         success: true,
-        mode: 'Laporan Rangkuman Keseluruhan (Read-Only)',
+        mode: 'Laporan Rangkuman Keseluruhan 4 Lapisan (Read-Only)',
         waktu_eksekusi_detik: parseFloat(((Date.now() - startTime) / 1000).toFixed(2)),
         total_katalog_trends: totalCatalog,
         total_produk_trends_terbaca: allTrendsItems.length,
-        total_varian_shopify_terbaca: totalVariantsScanned,
+        total_varian_shopify_terbaca: maps.totalVariantsScanned,
         rangkuman: {
           varian_harga_sudah_sesuai: variantsAlreadyMatch,
           varian_perlu_update_harga: variantsNeedUpdate,
           produk_trends_tanpa_harga_dilewati: skippedNoPrice,
           sku_trends_tidak_ada_di_shopify: notFoundInShopify
         },
+        rincian_metode_kecocokan_varian: matchBreakdown,
         contoh_varian_perlu_update: sampleNeedUpdate,
         contoh_sku_tidak_ada_di_shopify: sampleNotFound
       });
@@ -530,7 +670,6 @@ export default async function handler(req, res) {
     const isCron = req.query.cron === '1';
     const PAGE_SIZE = 150;
 
-    // Akumulator kumulatif lintas halaman
     let accChecked = parseInt(req.query.acc_checked || '0', 10);
     let accUpdated = parseInt(req.query.acc_updated || '0', 10);
     let accUnchanged = parseInt(req.query.acc_unchanged || '0', 10);
@@ -596,30 +735,20 @@ export default async function handler(req, res) {
           rawName,
           cleanTitle: normalizeTitle(rawName),
           minQty: costInfo.qty,
-          blankPrice: costInfo.blankPrice,
-          brandingUnitCost: costInfo.brandingUnitCost,
-          brandingSetupCost: costInfo.brandingSetupCost,
           totalBaseCost: costInfo.totalBaseCost,
           newPriceStr: finalPriceStr
         });
       }
 
-      const { skuMap, titleMap } = await lookupShopifyVariantsBatch(
+      const maps = await lookupShopifyVariants4Layers(
         validProducts,
         SHOPIFY_STORE,
-        SHOPIFY_TOKEN,
-        enableTitleFallback
+        SHOPIFY_TOKEN
       );
 
       const updatesByProduct = {};
       for (const prod of validProducts) {
-        let matches = skuMap.get(prod.skuLower);
-        let matchSource = 'sku';
-
-        if ((!matches || matches.length === 0) && enableTitleFallback) {
-          matches = titleMap.get(prod.cleanTitle);
-          matchSource = 'nama_produk (sku null)';
-        }
+        const { matches, layer } = resolveProductMatches(prod, maps);
 
         if (!matches || matches.length === 0) {
           sessionNotFound++;
@@ -634,7 +763,8 @@ export default async function handler(req, res) {
             updatesByProduct[variant.productId].push({
               variantId: variant.variantId,
               sku: prod.sku,
-              matchSource,
+              shopifySku: variant.shopifySku,
+              matchSource: layer,
               minQty: prod.minQty,
               totalBaseCost: prod.totalBaseCost,
               currentShopifyPrice: variant.currentPrice,
@@ -693,7 +823,8 @@ export default async function handler(req, res) {
                 sessionUpdated++;
                 if (updatedDetails.length < 50) {
                   updatedDetails.push({
-                    sku: item.sku,
+                    sku_trends: item.sku,
+                    sku_shopify: item.shopifySku,
                     cocok_via: item.matchSource,
                     qty_terendah: item.minQty,
                     total_modal_per_unit: item.totalBaseCost,
@@ -721,9 +852,8 @@ export default async function handler(req, res) {
     const protocol = req.headers['x-forwarded-proto'] || 'https';
     const host = req.headers.host;
     const paramQuery = detectedPageParam ? `&p_param=${detectedPageParam}` : '';
-    const titleQuery = enableTitleFallback ? '&match_title=1' : '';
     const accQuery = `&acc_checked=${accChecked}&acc_updated=${accUpdated}&acc_unchanged=${accUnchanged}&acc_skipped=${accSkipped}&acc_notfound=${accNotFound}`;
-    const nextUrl = `${protocol}://${host}/api/sync?page=${currentPage}${paramQuery}${titleQuery}${accQuery}`;
+    const nextUrl = `${protocol}://${host}/api/sync?page=${currentPage}${paramQuery}${accQuery}`;
 
     if (isCron && !isFinished && host) {
       const nextCronUrl = `${nextUrl}&cron=1`;
@@ -775,7 +905,7 @@ export default async function handler(req, res) {
           </style>
         </head>
         <body>
-          <h2>Sinkronisasi Harga Trends.nz → Shopify</h2>
+          <h2>Sinkronisasi Harga Trends.nz → Shopify + (Report SKU Match)</h2>
           <p><span class="badge">${isFinished ? 'SELESAI 100%' : `MEMPROSES HALAMAN ${currentPage} DARI ${totalPages}...`}</span></p>
           <pre>${JSON.stringify(summaryPayload, null, 2)}</pre>
         </body>
